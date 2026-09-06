@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "xdr-mcp"
+dynamic = ["version"]
+description = "MCP server for the F6 XDR platform API"
+readme = "README.md"
+authors = [{ name = "Future Joint-Stock Company", email = "mxdr@f6.ru" }]
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+keywords = ["mcp", "model-context-protocol", "xdr", "security"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Information Technology",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+]
+dependencies = [
+    "mcp==2.0.0",
+    # imported directly by server.py; mcp 2.0.0 pins it too, declared explicitly
+    "mcp-types==2.0.0",
+    "httpx==0.28.1",
+]
+
+[project.scripts]
+xdr-mcp = "xdr_mcp.server:cli"
+
+[project.urls]
+Homepage = "https://github.com/F6-Security/xdr-mcp"
+Issues = "https://github.com/F6-Security/xdr-mcp/issues"
+
+[dependency-groups]
+dev = ["ruff==0.14.2"]
+
+[tool.hatch.version]
+path = "src/xdr_mcp/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/xdr_mcp"]
+
+[tool.hatch.build.targets.sdist]
+# README artwork is referenced by absolute URL, so it has no business riding
+# along into every install — and recordings would only make that worse.
+exclude = ["docs"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "S"]
+ignore = ["S101"]  # assert is fine in tests
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106"]  # test fixtures carry obvious fake tokens

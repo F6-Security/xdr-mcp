@@ -1,0 +1,9 @@
+venv/
+/dist/
+*.egg-info/
+.venv/
+__pycache__/
+*.py[cod]
+.env
+opencode.json
+.DS_Store

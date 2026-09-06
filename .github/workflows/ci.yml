@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Hash-pinned: the server holds a live XDR token, so a substituted
+      # dependency is a credential compromise, not just a broken build.
+      - name: Install locked dependencies
+        run: pip install --require-hashes -r requirements.lock
+
+      - name: Install the package without touching the locked tree
+        run: pip install --no-deps -e .
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Check the server starts and lists its tools
+        env:
+          XDR_BASE_URL: https://xdr.example.com
+          XDR_API_KEY: ci-placeholder
+        run: |
+          timeout 60 python - <<'PY'
+          import json, subprocess
+
+          REQUESTS = [
+              {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+               "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                          "clientInfo": {"name": "ci", "version": "0"}}},
+              {"jsonrpc": "2.0", "method": "notifications/initialized"},
+              {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+          ]
+
+          server = subprocess.Popen(
+              ["xdr-mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+          )
+          for request in REQUESTS:
+              server.stdin.write(json.dumps(request) + "\n")
+          server.stdin.flush()
+
+          tools = None
+          try:
+              # Read while stdin stays open. Closing it first makes the server
+              # exit on EOF before it has answered.
+              for line in server.stdout:
+                  message = json.loads(line)
+                  if message.get("id") == 2:
+                      tools = [t["name"] for t in message["result"]["tools"]]
+                      break
+          finally:
+              server.stdin.close()
+              server.terminate()
+              server.wait(timeout=10)
+
+          assert tools is not None, "no tools/list response"
+          # xdr_mark_event must stay hidden unless XDR_ALLOW_WRITE is set.
+          assert "xdr_mark_event" not in tools, tools
+          assert len(tools) == 4, tools
+          print("handshake OK:", tools)
+          PY
+
+      - name: Check the lock satisfies what the package declares
+        run: pip check
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install ruff==0.14.2
+
+      # Lint only. The formatter is deliberately not enforced: adopting it would
+      # reformat every file and bury real changes in style noise.
+      - run: ruff check .
+
+  lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          # pinned so a resolver change cannot turn this job red on its own
+          version: "0.12.10"
+
+      # Fails if pyproject.toml and requirements.lock have drifted apart.
+      # The lock is copied under its own name first: uv seeds the resolution
+      # from an existing output file, so this asks "does the lock still match
+      # pyproject" rather than "is it the newest resolve", which would go red
+      # every time any transitive dependency publishes a release. The header
+      # line records the output path and is expected to differ. --python-version
+      # is required: without it uv resolves against whatever interpreter happens
+      # to run it, which changes markers and drops python-conditional packages.
+      - name: Verify the lock is current
+        run: |
+          mkdir -p /tmp/lockcheck
+          cp requirements.lock /tmp/lockcheck/requirements.lock
+          uv pip compile pyproject.toml --universal --python-version 3.10 \
+            --generate-hashes -o /tmp/lockcheck/requirements.lock --quiet
+          diff -u \
+            <(grep -v '^#    uv pip compile' requirements.lock) \
+            <(grep -v '^#    uv pip compile' /tmp/lockcheck/requirements.lock)
