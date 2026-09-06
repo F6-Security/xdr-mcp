@@ -89,7 +89,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: pip install ruff==0.14.2
+      # ruff's version lives in pyproject's dev group so CI and a contributor's
+      # machine cannot drift apart. --group needs pip 25.1 or newer.
+      - run: |
+          python -m pip install --upgrade pip
+          pip install --group dev
 
       # Lint only. The formatter is deliberately not enforced: adopting it would
       # reformat every file and bury real changes in style noise.

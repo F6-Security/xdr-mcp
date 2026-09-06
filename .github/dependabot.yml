@@ -1,18 +1,27 @@
 version: 2
 updates:
   # Actions are pinned by commit SHA, which freezes them until something moves
-  # them deliberately. Dependabot is that something: it opens a PR with the new
-  # SHA and the release notes behind it.
+  # them deliberately. Dependabot is that something: it opens a pull request
+  # with the new SHA and the release notes behind it. Grouped, because six
+  # separate pull requests for six actions is noise rather than signal.
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
     commit-message:
       prefix: ci
 
+  # Version updates are switched off on purpose. The Python pins live in
+  # pyproject.toml and the resolved set in requirements.lock; Dependabot edits
+  # the first and cannot regenerate the second, so each pull request arrives
+  # with the two out of step. Worse, mcp pins mcp-types to an exact version, so
+  # a single-dependency bump produces a set that does not resolve at all.
+  # A limit of zero leaves Dependabot security alerts and their updates working.
   - package-ecosystem: pip
     directory: /
     schedule:
-      interval: weekly
-    commit-message:
-      prefix: deps
+      interval: monthly
+    open-pull-requests-limit: 0

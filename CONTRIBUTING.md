@@ -8,6 +8,7 @@
 python3 -m venv venv
 ./venv/bin/pip install --require-hashes -r requirements.lock
 ./venv/bin/pip install --no-deps -e .
+./venv/bin/pip install --group dev
 ```
 
 Зависимости ставятся из лока с проверкой хешей: сервер держит живой API-токен,
@@ -23,6 +24,9 @@ python3 -m venv venv
 
 Тесты не требуют сети и работают на stdlib `unittest`. Форматтер `ruff format`
 намеренно не включён в CI.
+
+Версия `ruff` задана один раз, в группе `dev` в `pyproject.toml`, и CI ставит её
+оттуда же — чтобы линтер на машине разработчика и в сборке не расходились.
 
 ## Зависимости
 

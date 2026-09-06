@@ -23,9 +23,11 @@ classifiers = [
     "Topic :: Security",
 ]
 dependencies = [
-    "mcp==2.0.0",
-    # imported directly by server.py; mcp 2.0.0 pins it too, declared explicitly
-    "mcp-types==2.0.0",
+    "mcp==2.1.1",
+    # imported directly by server.py, so it is declared rather than left implicit.
+    # Deliberately unpinned: mcp pins it to an exact version of its own, and a
+    # second exact pin here makes the two impossible to update independently.
+    "mcp-types",
     "httpx==0.28.1",
 ]
 
@@ -37,7 +39,7 @@ Homepage = "https://github.com/F6-Security/xdr-mcp"
 Issues = "https://github.com/F6-Security/xdr-mcp/issues"
 
 [dependency-groups]
-dev = ["ruff==0.14.2"]
+dev = ["ruff==0.16.6"]
 
 [tool.hatch.version]
 path = "src/xdr_mcp/__init__.py"
