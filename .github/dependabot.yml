@@ -1,0 +1,18 @@
+version: 2
+updates:
+  # Actions are pinned by commit SHA, which freezes them until something moves
+  # them deliberately. Dependabot is that something: it opens a PR with the new
+  # SHA and the release notes behind it.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps
