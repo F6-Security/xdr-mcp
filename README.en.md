@@ -23,12 +23,13 @@ searchable in the platform's own query language.
 | `xdr_count` | Number of records |
 | `xdr_get_mapping` | Fields available for search |
 | `xdr_get_filters` | Values available for filters |
+| `xdr_get_suggestions` | Real values of a field, by prefix |
 | `xdr_mark_event` | Mark an object: resolve an alert, flag a false positive |
 
 Sections: `alerts`, `incidents`, `emails`, `files`, `events`, `connections`,
 `assets`, `modules`, `audit`, `applications`.
 
-The first four tools only read. `xdr_mark_event` changes data and is off by
+The first five tools only read. `xdr_mark_event` changes data and is off by
 default — see Security below.
 
 ## Quick start
@@ -86,6 +87,11 @@ audit         success : "false" AND timestamp >= now-7d
 Conditions combine with `AND`, `OR`, `NOT` and group with parentheses. Time
 filtering uses the `timestamp` field, relative (`now-1d`, `now-6h`) or absolute.
 `xdr_get_mapping` lists the fields a section accepts.
+
+A string value may contain `*` in any position: `name : "VDI-5*"`,
+`file_name : "*.exe"`. Without one it has to match exactly. When a query returns nothing
+and the value may be spelled differently, `xdr_get_suggestions` gives the real spelling:
+the platform answers an unmatched value with zero records rather than an error.
 
 ## Security
 

@@ -41,7 +41,7 @@ class TestWriteGate(unittest.TestCase):
         s = load_server()
         self.assertFalse(s.ALLOW_WRITE)
         self.assertNotIn("xdr_mark_event", [t.name for t in s.TOOLS])
-        self.assertEqual(len(s.TOOLS), 4)
+        self.assertEqual(len(s.TOOLS), 5)
 
     def test_enabled_by_flag(self):
         for value in ("1", "true", "TRUE", "yes"):
@@ -392,6 +392,12 @@ class TestToolDeclarations(unittest.TestCase):
         self.assertEqual(server.SECTIONS["incidents"]["ordering"], ("created_at", "updated_at"))
         self.assertNotIn("alerts: ts_created", server.ORDERING_DESCRIPTION)
 
+    def test_query_description_covers_wildcards(self):
+        # Without this the model has no way to know * is available, and a search
+        # by name, path or domain is close to unusable.
+        self.assertIn("wildcard", server.QUERY_DESCRIPTION)
+        self.assertIn("xdr_get_suggestions", server.QUERY_DESCRIPTION)
+
     def test_query_description_does_not_teach_values_that_return_nothing(self):
         # Both were wrong in the shipped description and fail silently against the
         # API: severity has no "high"/"medium", and the calendar-rounding forms
@@ -472,6 +478,28 @@ class TestToolDispatch(unittest.TestCase):
     def test_count_with_query_is_a_post(self):
         request, _ = self.call("xdr_count", {"section": "alerts", "query": "sev"})
         request.assert_awaited_once_with("POST", "/api/v1/alerts/count/", {"search": "sev"})
+
+    def test_suggestions(self):
+        request, _ = self.call(
+            "xdr_get_suggestions",
+            {"section": "assets", "field": "company_name", "prefix": "ЛЕГ"},
+        )
+        request.assert_awaited_once_with(
+            "GET", "/api/assets/search_help/?field=company_name&prefix=%D0%9B%D0%95%D0%93"
+        )
+
+    def test_suggestions_without_a_prefix(self):
+        request, _ = self.call("xdr_get_suggestions", {"section": "assets", "field": "status"})
+        request.assert_awaited_once_with("GET", "/api/assets/search_help/?field=status")
+
+    def test_suggestions_need_a_field(self):
+        for field in (None, "", "   ", 5):
+            with self.subTest(field=field):
+                request, result = self.call(
+                    "xdr_get_suggestions", {"section": "assets", "field": field}
+                )
+                request.assert_not_awaited()
+                self.assertTrue(result.is_error)
 
     def test_mapping_and_filters(self):
         request, _ = self.call("xdr_get_mapping", {"section": "applications"})

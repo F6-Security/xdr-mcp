@@ -236,8 +236,12 @@ QUERY_DESCRIPTION = (
     'Pass an empty string to list the whole section unfiltered — deliberately, since that can be '
     "a very large number of records. "
     "Fields can be combined with AND, OR, AND NOT, OR NOT and grouped with parentheses. "
-    "Call xdr_get_mapping for the fields a section accepts, and xdr_get_filters for the values an "
-    "enumerated field takes — a value outside that set returns zero results rather than an error. "
+    "A string value may contain * as a wildcard, in any position: name : \"VDI-5*\", "
+    'file_name : "*.exe", domain : "*corp*". Without a wildcard a string value must match exactly. '
+    "Numeric and date fields do not take wildcards. "
+    "Call xdr_get_mapping for the fields a section accepts, xdr_get_filters for the values an "
+    "enumerated field takes, and xdr_get_suggestions to look up the exact spelling of a value — a "
+    "value outside the accepted set returns zero results rather than an error. "
     "Time filtering uses the timestamp field, relative (timestamp >= now-1d, now-6h) or absolute "
     '(timestamp >= "2024-01-01T00:00:00.000+03:00"). The calendar-rounding forms now/d, now/w and '
     "now/M return nothing, so use now-1d and the like. Note that timestamp is a search field: the "
@@ -459,6 +463,38 @@ TOOLS = [
         },
     ),
     types.Tool(
+        name="xdr_get_suggestions",
+        description=(
+            "Look up real values of a field, optionally narrowed by a prefix. Use it when a query "
+            "returns nothing and the value may simply be spelled differently — an unmatched value "
+            "is answered with zero records rather than an error, so a guess is indistinguishable "
+            "from a genuine absence. Each entry has a value to put in a query and a label for "
+            "display; search on the value. Returns up to about ten entries, so narrow the prefix "
+            "to see more. Field names come from xdr_get_mapping, where the ones worth asking "
+            "about carry show_suggestions; an unknown field name comes back empty rather than as "
+            "an error."
+        ),
+        annotations=READ_ONLY_ANNOTATIONS,
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "section": SECTION_PROPERTY,
+                "field": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Field to list values of, as named by xdr_get_mapping",
+                },
+                "prefix": {
+                    "type": "string",
+                    "description": (
+                        "Return only values starting with this. Omit for the field's first values."
+                    ),
+                },
+            },
+            "required": ["section", "field"],
+        },
+    ),
+    types.Tool(
         name="xdr_get_filters",
         description="Get available filter options for an XDR section.",
         annotations=READ_ONLY_ANNOTATIONS,
@@ -516,6 +552,14 @@ async def on_call_tool(
         elif name == "xdr_get_mapping":
             section = get_section(args.get("section"))
             result = await xdr_request("GET", f"/api/{section['path']}/mapping/")
+
+        elif name == "xdr_get_suggestions":
+            section = get_section(args.get("section"))
+            field = args.get("field")
+            if not isinstance(field, str) or not field.strip():
+                raise ValueError("field is required and must be a non-empty string")
+            qs = build_query_string({"field": field, "prefix": args.get("prefix") or None})
+            result = await xdr_request("GET", f"/api/{section['path']}/search_help/{qs}")
 
         elif name == "xdr_get_filters":
             section = get_section(args.get("section"))

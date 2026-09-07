@@ -73,7 +73,7 @@ jobs:
           assert tools is not None, "no tools/list response"
           # xdr_mark_event must stay hidden unless XDR_ALLOW_WRITE is set.
           assert "xdr_mark_event" not in tools, tools
-          assert len(tools) == 4, tools
+          assert len(tools) == 5, tools
           print("handshake OK:", tools)
           PY
 
