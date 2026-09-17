@@ -27,7 +27,7 @@ MCP-сервер к платформе [F6 XDR](https://f6.security). Даёт �
 | `xdr_mark_event` | Пометить объект: закрыть алерт, отметить ложное срабатывание |
 
 Секции: `alerts`, `incidents`, `emails`, `files`, `events`, `connections`, `assets`,
-`modules`, `audit`, `applications`.
+`modules`, `audit`, `applications`, `application_versions`.
 
 Первые пять тулов только читают. `xdr_mark_event` изменяет данные и по умолчанию
 выключен, см. раздел «Безопасность».
@@ -85,14 +85,38 @@ audit         success : "false" AND timestamp >= now-7d
 ```
 
 Условия объединяются через `AND`, `OR`, `NOT` и группируются скобками. Время —
-поле `timestamp`, относительное (`now-1d`, `now-6h`) или абсолютное. Какие поля
-доступны в секции, покажет `xdr_get_mapping`.
+обычно поле `timestamp`, относительное (`now-1d`, `now-6h`) или абсолютное.
+Какие поля доступны в секции, покажет `xdr_get_mapping`; в `application_versions`
+для дат используются `first_seen` и `last_seen`.
 
 В строковых значениях работает `*` в любой позиции: `name : "VDI-5*"`,
 `file_name : "*.exe"`. Без него значение должно совпасть точно. Если запрос ничего не
 вернул, а значение могло писаться иначе, точное написание подскажет
 `xdr_get_suggestions`: платформа отвечает на несовпавшее значение нулём записей, а не
 ошибкой.
+
+### Версии программного обеспечения
+
+`applications` возвращает программное обеспечение, а `application_versions` —
+записи его версий на активах. Сначала найдите нужное ПО в `applications`, затем
+используйте его `uuid` в поле `software_id`:
+
+```
+application_versions  software_id : "<software_uuid>"
+application_versions  software_id : "<software_uuid>" AND version : "1.2.3"
+application_versions  asset : "<machine_id>" AND last_seen >= now-7d
+```
+
+`software_id` поддерживается поиском, хотя отсутствует в `xdr_get_mapping`.
+Поле `asset` принимает `machine_id` или точный `current_name`, соответствующий
+одному активу. Ответ включает `version`, `uuid`, `ts_created`, `ts_updated`
+и сведения об активе, например `machine_id` и `computer_name`.
+
+Для секции доступны все пять читающих тулов. Пагинация использует `page_size`
+и `offset`; сортировка — `version`, `ts_created`, `ts_updated` с необязательным
+префиксом `-`. `xdr_count` считает записи версий на активах: одинаковая версия
+на разных активах может встречаться несколько раз. Поле `version` имеет
+`show_suggestions=false`, поэтому пустой список подсказок допустим.
 
 ## Безопасность
 

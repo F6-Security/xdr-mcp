@@ -27,7 +27,7 @@ searchable in the platform's own query language.
 | `xdr_mark_event` | Mark an object: resolve an alert, flag a false positive |
 
 Sections: `alerts`, `incidents`, `emails`, `files`, `events`, `connections`,
-`assets`, `modules`, `audit`, `applications`.
+`assets`, `modules`, `audit`, `applications`, `application_versions`.
 
 The first five tools only read. `xdr_mark_event` changes data and is off by
 default — see Security below.
@@ -85,13 +85,37 @@ audit         success : "false" AND timestamp >= now-7d
 ```
 
 Conditions combine with `AND`, `OR`, `NOT` and group with parentheses. Time
-filtering uses the `timestamp` field, relative (`now-1d`, `now-6h`) or absolute.
-`xdr_get_mapping` lists the fields a section accepts.
+filtering usually uses the `timestamp` field, with relative (`now-1d`, `now-6h`)
+or absolute values. `xdr_get_mapping` lists the fields a section accepts;
+`application_versions` uses `first_seen` and `last_seen` for dates.
 
 A string value may contain `*` in any position: `name : "VDI-5*"`,
 `file_name : "*.exe"`. Without one it has to match exactly. When a query returns nothing
 and the value may be spelled differently, `xdr_get_suggestions` gives the real spelling:
 the platform answers an unmatched value with zero records rather than an error.
+
+### Software versions
+
+`applications` returns software, while `application_versions` returns records
+of its versions on assets. Find the software in `applications` first, then use
+its `uuid` as `software_id`:
+
+```
+application_versions  software_id : "<software_uuid>"
+application_versions  software_id : "<software_uuid>" AND version : "1.2.3"
+application_versions  asset : "<machine_id>" AND last_seen >= now-7d
+```
+
+Search supports `software_id` even though `xdr_get_mapping` does not expose it.
+The `asset` field accepts a `machine_id` or exact `current_name` identifying
+a single asset. Results include `version`, `uuid`, `ts_created`, `ts_updated`
+and asset details such as `machine_id` and `computer_name`.
+
+All five read tools support this section. Pagination uses `page_size` and
+`offset`; ordering accepts `version`, `ts_created`, `ts_updated` with an optional
+`-` prefix. `xdr_count` counts version records on assets: the same version may
+occur on multiple assets. The `version` field has `show_suggestions=false`,
+so an empty suggestions list is valid.
 
 ## Security
 
