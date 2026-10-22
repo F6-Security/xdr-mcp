@@ -43,6 +43,15 @@ future. It is applied asynchronously and this server cannot undo it. It is
 hidden unless `XDR_ALLOW_WRITE` is set; keep it unset where reads are enough,
 and do not add it to a client's auto-approve list.
 
+**Collected artifacts are host data at its most sensitive.** An artifact can
+hold a memory dump, credential stores or shell history. Listing them puts only
+metadata in the model's context — file names, sizes, who collected what.
+`xdr_download_artifact` writes the content to disk and returns just the path and
+size, so the content itself does not reach the model provider; but whatever can
+read that folder can read the artifacts. The tool is hidden unless
+`XDR_DOWNLOAD_DIR` is set, and it writes nowhere else: the file name the API
+sends is reduced to a plain name before use, so it cannot steer the path.
+
 **The API key goes wherever `XDR_BASE_URL` points.** The URL is validated at
 startup — https only, no query or fragment — so the key cannot travel in the
 clear or to a malformed address. It is still sent to whatever host the value
@@ -56,4 +65,5 @@ switch by design. For an internal CA, point `XDR_CA_BUNDLE` at a PEM bundle.
 
 It makes no network calls other than to `XDR_BASE_URL`, reads no environment
 variables beyond the ones documented in the README, sends no telemetry, and
-writes no files.
+writes no files — except downloaded artifacts, only into `XDR_DOWNLOAD_DIR` and
+only when it is set.

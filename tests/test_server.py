@@ -10,13 +10,18 @@ Run from the repository root:
 
 import importlib
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 from unittest import mock
+
+import httpx
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 BASE_ENV = {"XDR_BASE_URL": "https://xdr.example.com", "XDR_API_KEY": "test-key"}
+ARTIFACT_ID = "6f1c2e3d-4b5a-4c6d-8e7f-90a1b2c3d4e5"
 
 
 def load_server(**env):
@@ -41,7 +46,7 @@ class TestWriteGate(unittest.TestCase):
         s = load_server()
         self.assertFalse(s.ALLOW_WRITE)
         self.assertNotIn("xdr_mark_event", [t.name for t in s.TOOLS])
-        self.assertEqual(len(s.TOOLS), 5)
+        self.assertEqual(len(s.TOOLS), 7)
 
     def test_enabled_by_flag(self):
         for value in ("1", "true", "TRUE", "yes"):
@@ -64,6 +69,36 @@ class TestWriteGate(unittest.TestCase):
         request.assert_not_called()
         self.assertTrue(result.is_error)
         self.assertIn("XDR_ALLOW_WRITE", result.content[0].text)
+
+
+class TestDownloadGate(unittest.TestCase):
+    """xdr_download_artifact writes host artifacts to disk, so it is opt-in too."""
+
+    def test_disabled_by_default(self):
+        s = load_server()
+        self.assertEqual(s.DOWNLOAD_DIR, "")
+        self.assertNotIn("xdr_download_artifact", [t.name for t in s.TOOLS])
+
+    def test_enabled_by_a_folder(self):
+        with tempfile.TemporaryDirectory() as folder:
+            s = load_server(XDR_DOWNLOAD_DIR=folder)
+        self.assertEqual(s.DOWNLOAD_DIR, os.path.abspath(folder))
+        self.assertIn("xdr_download_artifact", [t.name for t in s.TOOLS])
+
+    def test_a_missing_folder_fails_at_startup(self):
+        with self.assertRaisesRegex(RuntimeError, "not a directory"):
+            load_server(XDR_DOWNLOAD_DIR="/nonexistent/downloads")
+
+    def test_calling_it_while_disabled_is_refused(self):
+        s = load_server()
+        params = s.types.CallToolRequestParams(
+            name="xdr_download_artifact", arguments={"internal_id": str(ARTIFACT_ID)}
+        )
+        with mock.patch.object(s, "download_artifact") as download:
+            result = run(s.on_call_tool(None, params))
+        download.assert_not_called()
+        self.assertTrue(result.is_error)
+        self.assertIn("XDR_DOWNLOAD_DIR", result.content[0].text)
 
 
 class TestBaseUrlValidation(unittest.TestCase):
@@ -368,12 +403,18 @@ class TestValidateMatcher(unittest.TestCase):
 
 class TestToolDeclarations(unittest.TestCase):
     def test_only_the_write_tool_is_marked_destructive(self):
-        s = load_server(XDR_ALLOW_WRITE="1")
+        with tempfile.TemporaryDirectory() as folder:
+            s = load_server(XDR_ALLOW_WRITE="1", XDR_DOWNLOAD_DIR=folder)
         for tool in s.TOOLS:
             with self.subTest(tool=tool.name):
                 if tool.name == "xdr_mark_event":
                     self.assertFalse(tool.annotations.read_only_hint)
                     self.assertTrue(tool.annotations.destructive_hint)
+                elif tool.name == "xdr_download_artifact":
+                    # Reads XDR only, but writes a local file: not read-only,
+                    # and nothing it does destroys anything.
+                    self.assertFalse(tool.annotations.read_only_hint)
+                    self.assertFalse(tool.annotations.destructive_hint)
                 else:
                     self.assertTrue(tool.annotations.read_only_hint)
 
@@ -508,6 +549,80 @@ class TestToolDispatch(unittest.TestCase):
         request, _ = self.call("xdr_get_filters", {"section": "audit"})
         request.assert_awaited_once_with("GET", "/api/system_logs/filters/")
 
+    def test_list_artifacts_of_an_asset(self):
+        request, result = self.call("xdr_list_artifacts", {"asset_id": 7})
+        request.assert_awaited_once_with(
+            "GET", "/api/assets/forensic-reports/?asset_id=7&ordering=-ts_created&cursor=1&page_size=20"
+        )
+        self.assertFalse(result.is_error)
+
+    def test_list_artifacts_pages_by_cursor(self):
+        # The endpoint takes the page number as "cursor"; "page" and "offset"
+        # are ignored and return the first page again.
+        request, _ = self.call(
+            "xdr_list_artifacts", {"page": 3, "page_size": 5, "ordering": "ts_created"}
+        )
+        request.assert_awaited_once_with(
+            "GET", "/api/assets/forensic-reports/?ordering=ts_created&cursor=3&page_size=5"
+        )
+
+    def test_list_artifacts_by_machine_id_looks_the_asset_up_first(self):
+        # The list ignores a machine_id filter, so it is turned into the asset id.
+        params = self.server.types.CallToolRequestParams(
+            name="xdr_list_artifacts", arguments={"machine_id": ARTIFACT_ID.upper()}
+        )
+        with mock.patch.object(self.server, "xdr_request", new_callable=mock.AsyncMock) as request:
+            request.side_effect = [{"data": {"id": 42}}, {"data": {"count": 0, "results": []}}]
+            result = run(self.server.on_call_tool(None, params))
+        self.assertEqual(
+            request.await_args_list,
+            [
+                mock.call("GET", f"/api/assets/{ARTIFACT_ID}/"),
+                mock.call(
+                    "GET",
+                    "/api/assets/forensic-reports/?asset_id=42&ordering=-ts_created&cursor=1&page_size=20",
+                ),
+            ],
+        )
+        self.assertFalse(result.is_error)
+
+    def test_list_artifacts_keeps_only_the_useful_fields(self):
+        row = {field: field for field in self.server.ARTIFACT_FIELDS}
+        params = self.server.types.CallToolRequestParams(name="xdr_list_artifacts", arguments={})
+        with mock.patch.object(self.server, "xdr_request", new_callable=mock.AsyncMock) as request:
+            request.return_value = {
+                "data": {"count": 1, "next": None, "results": [{**row, "need_rotation": True}]}
+            }
+            result = run(self.server.on_call_tool(None, params))
+        self.assertIn('"internal_id": "internal_id"', result.content[0].text)
+        self.assertNotIn("need_rotation", result.content[0].text)
+
+    def test_list_artifacts_rejects_bad_arguments_before_the_request(self):
+        for arguments in (
+            {"ordering": "-size"},
+            {"machine_id": "not-a-uuid"},
+            {"asset_id": 0},
+            {"page_size": 100000},
+        ):
+            with self.subTest(arguments=arguments):
+                request, result = self.call("xdr_list_artifacts", arguments)
+                request.assert_not_awaited()
+                self.assertTrue(result.is_error)
+
+    def test_artifact_structure(self):
+        request, _ = self.call("xdr_get_artifact_structure", {"report_id": 5})
+        request.assert_awaited_once_with("GET", "/api/assets/forensic-reports/5/forensic-report/structure/")
+
+        request, _ = self.call("xdr_get_artifact_structure", {"report_id": 5, "path": "var//log/"})
+        request.assert_awaited_once_with(
+            "GET", "/api/assets/forensic-reports/5/forensic-report/structure/?path=%2Fvar%2Flog"
+        )
+
+    def test_artifact_structure_refuses_a_path_out_of_the_artifact(self):
+        request, result = self.call("xdr_get_artifact_structure", {"report_id": 5, "path": "/var/../etc"})
+        request.assert_not_awaited()
+        self.assertTrue(result.is_error)
+
     def test_mark_event_sends_the_validated_payload(self):
         payload = {
             "expression": 'id: "abc"',
@@ -596,6 +711,160 @@ class TestRequestErrorHandling(unittest.IsolatedAsyncioTestCase):
         s = load_server(XDR_BASE_URL="")
         with self.assertRaisesRegex(RuntimeError, "must be set"):
             await s.xdr_request("GET", "/api/assets/")
+
+
+class TestArtifactHelpers(unittest.TestCase):
+    def test_uuid_is_normalised(self):
+        self.assertEqual(server.as_uuid("internal_id", ARTIFACT_ID.upper()), ARTIFACT_ID)
+
+    def test_anything_but_a_uuid_is_refused(self):
+        # It goes into the URL path, so nothing else may.
+        for value in ("../../assets", "", None, 5, f"{ARTIFACT_ID}/x"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "must be a UUID"):
+                    server.as_uuid("internal_id", value)
+
+    def test_paths_are_normalised(self):
+        cases = {None: "/", "": "/", "/": "/", "var/log/": "/var/log", "\\var\\\\log": "/var/log"}
+        for value, expected in cases.items():
+            with self.subTest(value=value):
+                self.assertEqual(server.artifact_path(value), expected)
+
+    def test_paths_cannot_climb_out(self):
+        for value in ("..", "/var/../etc", "a/../../b"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, r"must not contain '\.\.'"):
+                    server.artifact_path(value)
+
+    def test_file_names_cannot_steer_the_path(self):
+        cases = {
+            'attachment; filename="2026-01-02T03:04:05.000001.zip"': "2026-01-02T03_04_05.000001.zip",
+            'attachment; filename="var/log/syslog.zip"': "syslog.zip",
+            'attachment; filename="..\\..\\evil.zip"': "evil.zip",
+            'attachment; filename="../.."': "artifact.zip",
+            'attachment; filename=""': "artifact.zip",
+            "": "artifact.zip",
+        }
+        for disposition, expected in cases.items():
+            with self.subTest(disposition=disposition):
+                self.assertEqual(
+                    server.artifact_file_name(ARTIFACT_ID, disposition), f"{ARTIFACT_ID[:8]}_{expected}"
+                )
+
+
+class TestDownloadArtifact(unittest.IsolatedAsyncioTestCase):
+    """The download streams to disk, and leaves nothing behind when it fails."""
+
+    def setUp(self):
+        self.folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.folder, True)
+        self.server = load_server(XDR_DOWNLOAD_DIR=self.folder)
+        self.requests = []
+
+    async def download(self, response, **arguments):
+        real_client = httpx.AsyncClient
+
+        def handler(request):
+            self.requests.append(request)
+            return response
+
+        def client(**kwargs):
+            kwargs.pop("verify")
+            return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+        with mock.patch.object(self.server.httpx, "AsyncClient", side_effect=client):
+            return await self.server.download_artifact({"internal_id": ARTIFACT_ID, **arguments})
+
+    @staticmethod
+    def zip_response(content, file_name):
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "application/octet-stream",
+                "content-disposition": f'attachment; filename="{file_name}"',
+            },
+            content=content,
+        )
+
+    def saved(self):
+        return sorted(os.listdir(self.folder))
+
+    async def test_the_whole_artifact(self):
+        result = await self.download(self.zip_response(b"PK zip", "2026-01-02T03:04:05.000001.zip"))
+
+        request = self.requests[0]
+        self.assertEqual(
+            request.url.raw_path, f"/api/assets/forensic-reports/{ARTIFACT_ID}/download/%2F/".encode()
+        )
+        self.assertEqual(request.headers["x-api-key"], "test-key")
+
+        name = f"{ARTIFACT_ID[:8]}_2026-01-02T03_04_05.000001.zip"
+        self.assertEqual(result, {
+            "internal_id": ARTIFACT_ID, "path": "/", "file": os.path.join(self.folder, name), "bytes": 6,
+        })
+        with open(result["file"], "rb") as file:
+            self.assertEqual(file.read(), b"PK zip")
+        self.assertEqual(self.saved(), [name])
+
+    async def test_one_file_inside_it(self):
+        result = await self.download(
+            self.zip_response(b"PK", "var/log/syslog.zip"), path="var/log/syslog"
+        )
+        self.assertTrue(
+            self.requests[0].url.raw_path.endswith(b"/download/%2Fvar%2Flog%2Fsyslog/")
+        )
+        self.assertEqual(os.path.basename(result["file"]), f"{ARTIFACT_ID[:8]}_syslog.zip")
+
+    async def test_a_path_not_in_the_artifact(self):
+        # The API answers it with a 200 and an empty zip rather than an error.
+        empty = b"PK\x05\x06" + b"\x00" * 18
+        with self.assertRaisesRegex(FileNotFoundError, "nothing at /nope"):
+            await self.download(self.zip_response(empty, ""), path="/nope")
+        self.assertEqual(self.saved(), [])
+
+    async def test_the_console_page_is_not_saved_as_an_artifact(self):
+        # Unknown routes come back as the console's HTML with a 200.
+        page = httpx.Response(200, headers={"content-type": "text/html"}, content=b"<html>secret</html>")
+        with self.assertRaisesRegex(RuntimeError, "API error 200") as ctx:
+            await self.download(page)
+        self.assertNotIn("secret", str(ctx.exception))
+        self.assertEqual(self.saved(), [])
+
+    async def test_a_json_error_is_reported_bounded(self):
+        denied = httpx.Response(403, json={"detail": "x" * 5000})
+        with self.assertRaisesRegex(RuntimeError, "API error 403") as ctx:
+            await self.download(denied)
+        self.assertLess(len(str(ctx.exception)), self.server.MAX_ERROR_CHARS + 100)
+        self.assertEqual(self.saved(), [])
+
+    async def test_a_declared_size_over_the_cap_is_refused(self):
+        big = self.zip_response(b"x" * (1024 * 1024 + 1), "big.zip")
+        with self.assertRaisesRegex(RuntimeError, "over max_mb=1"):
+            await self.download(big, max_mb=1)
+        self.assertEqual(self.saved(), [])
+
+    async def test_a_stream_over_the_cap_is_stopped_and_removed(self):
+        async def chunks():
+            for _ in range(3):
+                yield b"x" * (512 * 1024)
+
+        # No Content-Length: the cap can only be enforced while streaming.
+        streamed = httpx.Response(
+            200,
+            headers={"content-type": "application/octet-stream", "content-disposition": 'filename="b.zip"'},
+            content=chunks(),
+        )
+        with self.assertRaisesRegex(RuntimeError, "was stopped"):
+            await self.download(streamed, max_mb=1)
+        self.assertEqual(self.saved(), [])
+
+    async def test_bad_arguments_are_refused_before_the_request(self):
+        for arguments in ({"internal_id": "../x"}, {"path": "/a/../b"}, {"max_mb": 0}):
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(ValueError):
+                    await self.download(self.zip_response(b"PK", "a.zip"), **arguments)
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.saved(), [])
 
 
 if __name__ == "__main__":
