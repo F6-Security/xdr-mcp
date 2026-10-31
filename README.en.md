@@ -78,6 +78,7 @@ container — `docker run -i --rm -e XDR_BASE_URL -e XDR_API_KEY ghcr.io/f6-secu
 | `XDR_API_KEY` | Personal API token |
 | `XDR_ALLOW_WRITE` | `1` enables `xdr_mark_event`. Off by default |
 | `XDR_ALLOW_COLLECT` | `1` enables collecting artifacts from hosts: `xdr_collect_artifacts`, `xdr_abort_artifact_collection` and `xdr_list_artifact_presets`. Off by default |
+| `XDR_PASSWORD_PROMPT` | `1`: when the console asks for the second factor for protected parts of a collection, the server asks you for it in a window of its own (macOS or zenity) and sends it straight to the console, past the model. Off by default |
 | `XDR_DOWNLOAD_DIR` | Folder `xdr_download_artifact` saves artifacts into; setting it enables the tool. In a container, a path inside a mounted volume |
 | `XDR_CA_BUNDLE` | PEM bundle for an installation behind an internal CA |
 
@@ -128,7 +129,10 @@ a person saved in the console. One host per call; there is no bulk start. Paths 
 checked before the request, since a path outside the rules fails the whole
 collection. For paths, custom artifacts, the bug report, memory dumps, command
 history and a few other parts the platform asks for a one-time code unless the
-token's user has an IP allowlist; the model will then ask you for it. Only a
+token's user has an IP allowlist. With `XDR_PASSWORD_PROMPT=1` the server asks you
+for it in a window of its own and sends it straight to the console: the model never
+sees it, and the window shows what is being collected from which host. Without it
+the model asks you for the code in the chat. Only a
 collection still under way can be stopped: the platform takes an abort for a
 finished one too, and its archive can no longer be read afterwards. Keep the
 collection tools out of your MCP client's auto-approve list.

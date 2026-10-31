@@ -8,7 +8,9 @@ import fnmatch
 import json
 import os
 import re
+import shutil
 import ssl
+import sys
 import uuid
 from typing import Any
 from urllib.parse import quote, urlencode, urlsplit
@@ -40,6 +42,13 @@ ALLOW_WRITE = os.environ.get("XDR_ALLOW_WRITE", "").strip().lower() in ("1", "tr
 # thing from marking alerts, so it has a switch of its own: a setup that lets the
 # model resolve alerts has not thereby agreed to it acting on hosts.
 ALLOW_COLLECT = os.environ.get("XDR_ALLOW_COLLECT", "").strip().lower() in ("1", "true", "yes")
+
+# With XDR_PASSWORD_PROMPT the second factor a protected collection needs goes
+# from the person at this machine straight to the API: when the API turns the
+# collection down, the server asks for it in a window of its own. The model never
+# sees it, since it is not an argument, not in a result and not in an error.
+PASSWORD_PROMPT = os.environ.get("XDR_PASSWORD_PROMPT", "").strip().lower() in ("1", "true", "yes")
+PASSWORD_PROMPT_SECONDS = 120
 
 # Collected artifacts run from a few kilobytes of logs to memory dumps of many
 # gigabytes, so a download is capped unless the caller asks for more.
@@ -683,6 +692,115 @@ async def list_artifact_presets(args: dict[str, Any]) -> dict[str, Any]:
     return {"count": len(presets), "presets": presets}
 
 
+def api_message(error: Exception) -> str:
+    """The console's own message out of an "API error ...: {json}" text, or ''."""
+    text = str(error)
+    start = text.find("{")
+    try:
+        body = json.loads(text[start:]) if start >= 0 else {}
+    except ValueError:
+        return ""
+    messages = body.get("messages") if isinstance(body, dict) else None
+    return "; ".join(
+        str(item.get("message") or "") for item in messages or [] if isinstance(item, dict)
+    ).strip()
+
+
+async def ask_password(prompt: str) -> str | None:
+    """Ask the person at this machine for a secret in a window of its own.
+
+    The prompt goes in as an argument, never into the script itself, so nothing
+    in it can run. The window's own process has no stdin and its stdout is a
+    pipe: this server's stdio is the MCP channel. None if they cancel, or let
+    the window time out.
+    """
+    if sys.platform == "darwin":
+        argv = [
+            "/usr/bin/osascript",
+            "-e", "on run argv",
+            "-e", (
+                'set answer to display dialog (item 1 of argv) default answer "" with hidden answer '
+                'with title "F6 XDR" buttons {"Отмена", "Отправить"} default button "Отправить" '
+                f'cancel button "Отмена" with icon caution giving up after {PASSWORD_PROMPT_SECONDS}'
+            ),
+            "-e", "if gave up of answer then error number -128",
+            "-e", "return text returned of answer",
+            "-e", "end run",
+            prompt,
+        ]
+    elif shutil.which("zenity"):
+        # zenity reads Pango markup in --text
+        text = prompt.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        argv = [
+            "zenity", "--entry", "--hide-text", "--title=F6 XDR", f"--text={text}",
+            f"--timeout={PASSWORD_PROMPT_SECONDS}",
+        ]
+    else:
+        raise RuntimeError("XDR_PASSWORD_PROMPT needs macOS or zenity to show a password window")
+
+    process = await asyncio.create_subprocess_exec(
+        *argv,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        out, _ = await asyncio.wait_for(process.communicate(), PASSWORD_PROMPT_SECONDS + 15)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        return None
+    if process.returncode != 0:
+        return None
+    secret = out.decode("utf-8", "replace")
+    secret = secret[:-1] if secret.endswith("\n") else secret
+    return secret or None
+
+
+async def post_collection(body: dict[str, Any], what: str) -> dict[str, Any]:
+    """Create the collection; with XDR_PASSWORD_PROMPT, get the second factor from a window if asked.
+
+    The first request goes without it. The API checks the second factor before
+    it looks the host up, so a refused request has created nothing, and a token
+    that needs no code is never asked for one.
+    """
+    try:
+        return await xdr_request("POST", "/api/assets/forensic-reports/", body)
+    except RuntimeError as error:
+        protected = sorted(PROTECTED_PARTS & set(body))
+        if not protected or not str(error).startswith("API error 400"):
+            raise
+        if PASSWORD_PROMPT and "password" not in body:
+            message = api_message(error)
+            secret = await ask_password(
+                f"Сбор артефактов: {what}.\n\n"
+                + (f"Консоль: «{message}».\n\n" if message else "")
+                + "Введите одноразовый код или пароль, который просит консоль. "
+                "Он уйдёт прямо в консоль, модель его не увидит."
+            )
+            if not secret:
+                raise RuntimeError(
+                    f"{error}. The user closed the password window, so nothing was collected"
+                ) from None
+            try:
+                retry = {**body, "password": secret}
+                return await xdr_request("POST", "/api/assets/forensic-reports/", retry)
+            except RuntimeError as retry_error:
+                if api_message(retry_error) != message:
+                    raise  # the second factor was taken; this is some other refusal
+                raise RuntimeError(
+                    f"{retry_error}. The console turned down what the user typed in the window, so nothing "
+                    f"was collected. Calling again asks once more; three wrong codes lock the user out for "
+                    f"five minutes"
+                ) from None
+        raise RuntimeError(
+            f"{error}. This collection includes parts the platform guards with the user's second factor "
+            f"({', '.join(protected)}). If the message is about the code, ask the user for the current "
+            f"code from their authenticator app and call again with otp; three wrong codes lock them out "
+            f"for five minutes"
+        ) from error
+
+
 async def recent_collections(asset_id: int) -> list[dict[str, Any]]:
     qs = build_query_string({"asset_id": asset_id, "ordering": "-ts_created", "cursor": 1, "page_size": 10})
     result = await xdr_request("GET", f"/api/assets/forensic-reports/{qs}")
@@ -809,18 +927,13 @@ async def collect_artifacts(args: dict[str, Any]) -> dict[str, Any]:
     if otp:
         body["password"] = otp
 
-    try:
-        created = await xdr_request("POST", "/api/assets/forensic-reports/", body)
-    except RuntimeError as error:
-        protected = sorted(PROTECTED_PARTS & set(body))
-        if not protected or not str(error).startswith("API error 400"):
-            raise
-        raise RuntimeError(
-            f"{error}. This collection includes parts the platform guards with the user's second factor "
-            f"({', '.join(protected)}). If the message is about the code, ask the user for the current "
-            f"code from their authenticator app and call again with otp; three wrong codes lock them out "
-            f"for five minutes"
-        ) from error
+    host = card.get("alias") or card.get("current_name") or body["asset"]
+    what = list(artifacts)
+    if paths:
+        what.append("пути " + ", ".join(paths[:5]) + (f" и ещё {len(paths) - 5}" if len(paths) > 5 else ""))
+    if presets:
+        what.append("пользовательские артефакты " + ", ".join(f"«{preset['name']}»" for preset in presets))
+    created = await post_collection(body, f"{host} ({os_name}) — {'; '.join(what)}")
 
     report_id = (created.get("data") or {}).get("id")
     row = next((row for row in await recent_collections(asset_id) if row.get("id") == report_id), None)
@@ -1003,9 +1116,16 @@ COLLECT_ARTIFACTS_TOOL = types.Tool(
         "console — their commands run on the host. Arbitrary commands are not taken. memory_dump, "
         "page_file and hiber_file run to gigabytes. The platform asks for the user's one-time code for "
         + ", ".join(sorted(PROTECTED_PARTS - {"custom_paths", "files_to_upload", "preset_ids"}))
-        + ", paths and presets, unless the token's user has an IP allowlist; "
-        "when it asks, ask the user for the current code and pass it as 'otp'. Never guess it: three "
-        "wrong codes lock the user out for five minutes. A host takes one collection at a time, so "
+        + ", paths and presets, unless the token's user has an IP allowlist. "
+        + (
+            "When it asks, this server asks the user for it in a window of its own and sends it straight "
+            "to the console. Do not ask for it in the chat and do not pass otp; if the user closes the "
+            "window, nothing is collected. "
+            if PASSWORD_PROMPT else
+            "When it asks, ask the user for the current code and pass it as 'otp'. Never guess it: three "
+            "wrong codes lock the user out for five minutes. "
+        )
+        + "A host takes one collection at a time, so "
         "this refuses while one is still under way there. Returns the new collection's id."
     ),
     annotations=types.ToolAnnotations(

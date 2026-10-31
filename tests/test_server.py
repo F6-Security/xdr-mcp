@@ -1000,11 +1000,13 @@ def card(options=WINDOWS_OPTIONS, **fields):
 class FakeApi:
     """Answers the calls a collection makes, and records them."""
 
-    def __init__(self, asset, before=(), after=(), presets=(), post_error=None):
+    def __init__(self, asset, before=(), after=(), presets=(), post_error=None, post_errors=()):
         self.asset = asset
         self.reports = [list(before), list(after)]
         self.presets = list(presets)
         self.post_error = post_error
+        # one outcome per create request, in order; then success
+        self.post_errors = list(post_errors)
         self.calls = []
 
     async def __call__(self, method, path, body=None):
@@ -1018,8 +1020,9 @@ class FakeApi:
         if method == "GET" and path.startswith("/api/assets/"):
             return self.asset
         if method == "POST" and path == "/api/assets/forensic-reports/":
-            if self.post_error:
-                raise self.post_error
+            error = self.post_errors.pop(0) if self.post_errors else self.post_error
+            if error:
+                raise error
             return {"data": {"id": 501}}
         if method == "POST" and path.endswith("/forensic-report/abort/"):
             return {"messages": ["aborted"]}
@@ -1248,6 +1251,126 @@ class TestCollectArtifacts(unittest.TestCase):
         self.assertIn('"count": 1', text)
         self.assertIn("Linux · Logs", text)
         self.assertNotIn("creator_id", text)
+
+
+CODE_REFUSAL ='API error 400 Bad Request: {"data":[],"errors":[],"messages":[{"message":"Неверный код"}]}'
+
+
+class TestPasswordPrompt(unittest.TestCase):
+    """With XDR_PASSWORD_PROMPT the second factor comes from a window, never through the model."""
+
+    def setUp(self):
+        self.server = load_server(XDR_ALLOW_COLLECT="1", XDR_PASSWORD_PROMPT="1")
+
+    def collect(self, api, typed, **arguments):
+        params = self.server.types.CallToolRequestParams(
+            name="xdr_collect_artifacts", arguments={"machine_id": MACHINE_ID, **arguments}
+        )
+        ask = mock.AsyncMock(return_value=typed)
+        with mock.patch.object(self.server, "xdr_request", new=api), \
+                mock.patch.object(self.server, "ask_password", new=ask):
+            result = run(self.server.on_call_tool(None, params))
+        return result, ask
+
+    def test_off_by_default(self):
+        s = load_server(XDR_ALLOW_COLLECT="1")
+        self.assertFalse(s.PASSWORD_PROMPT)
+        self.assertIn("pass it as 'otp'", s.COLLECT_ARTIFACTS_TOOL.description)
+        self.assertIn("window of its own", self.server.COLLECT_ARTIFACTS_TOOL.description)
+        self.assertNotIn("pass it as 'otp'", self.server.COLLECT_ARTIFACTS_TOOL.description)
+
+    def test_the_window_supplies_the_second_factor(self):
+        api = FakeApi(card(LINUX_OPTIONS), post_errors=[RuntimeError(CODE_REFUSAL)])
+        result, ask = self.collect(api, "s3cret pass", artifacts=["shell_history"], paths=["/etc/hosts"])
+        self.assertFalse(result.is_error, result.content[0].text)
+        first, second = api.posts()
+        self.assertNotIn("password", first)
+        self.assertEqual(second["password"], "s3cret pass")
+        # The person sees what they are letting through, and what the console said.
+        prompt = ask.await_args.args[0]
+        for expected in ("WS-1 (Linux)", "shell_history", "/etc/hosts", "Неверный код"):
+            self.assertIn(expected, prompt)
+        self.assertNotIn("s3cret", result.content[0].text)
+
+    def test_closing_the_window_collects_nothing(self):
+        api = FakeApi(card(LINUX_OPTIONS), post_errors=[RuntimeError(CODE_REFUSAL)])
+        result, _ = self.collect(api, None, artifacts=["shell_history"])
+        self.assertTrue(result.is_error)
+        self.assertIn("closed the password window", result.content[0].text)
+        self.assertEqual(len(api.posts()), 1)
+
+    def test_a_wrong_second_factor_is_reported_without_it(self):
+        api = FakeApi(card(LINUX_OPTIONS), post_errors=[RuntimeError(CODE_REFUSAL)] * 2)
+        result, _ = self.collect(api, "hunter2-xyz", artifacts=["shell_history"])
+        self.assertTrue(result.is_error)
+        self.assertIn("turned down what the user typed", result.content[0].text)
+        self.assertNotIn("hunter2-xyz", result.content[0].text)
+        self.assertEqual(len(api.posts()), 2)
+
+    def test_another_refusal_after_the_second_factor_is_passed_on(self):
+        other = RuntimeError('API error 400 Bad Request: {"messages":[{"message":"service unavailable"}]}')
+        api = FakeApi(card(LINUX_OPTIONS), post_errors=[RuntimeError(CODE_REFUSAL), other])
+        result, _ = self.collect(api, "s3cret", artifacts=["shell_history"])
+        self.assertIn("service unavailable", result.content[0].text)
+        self.assertNotIn("turned down", result.content[0].text)
+
+    def test_a_one_time_code_is_asked_for_when_that_is_missing(self):
+        api = FakeApi(card(LINUX_OPTIONS), post_errors=[RuntimeError(CODE_REFUSAL)])
+        result, ask = self.collect(api, "123456", artifacts=["shell_history"])
+        self.assertFalse(result.is_error, result.content[0].text)
+        self.assertIn("одноразовый код", ask.await_args.args[0])
+        self.assertEqual(api.posts()[1]["password"], "123456")
+
+    def test_unprotected_refusals_open_no_window(self):
+        api = FakeApi(card(LINUX_OPTIONS), post_error=RuntimeError(CODE_REFUSAL))
+        result, ask = self.collect(api, "x", artifacts=["hosts"])
+        self.assertTrue(result.is_error)
+        ask.assert_not_awaited()
+
+    def test_a_code_from_the_model_is_used_as_is(self):
+        api = FakeApi(card(LINUX_OPTIONS), post_error=RuntimeError(CODE_REFUSAL))
+        result, ask = self.collect(api, "x", artifacts=["shell_history"], otp="123456")
+        ask.assert_not_awaited()
+        self.assertEqual([body["password"] for body in api.posts()], ["123456"])
+        self.assertIn("call again with otp", result.content[0].text)
+
+
+class TestAskPassword(unittest.IsolatedAsyncioTestCase):
+    """The window: its text cannot run, and it stays off the MCP channel."""
+
+    def setUp(self):
+        self.server = load_server()
+
+    async def ask(self, platform, returncode=0, out=b"pa ss\n"):
+        process = mock.MagicMock(returncode=returncode)
+        process.communicate = mock.AsyncMock(return_value=(out, b""))
+        spawn = mock.AsyncMock(return_value=process)
+        with mock.patch.object(self.server, "sys", mock.MagicMock(platform=platform)), \
+                mock.patch.object(self.server.asyncio, "create_subprocess_exec", new=spawn):
+            answer = await self.server.ask_password('x" & do shell script "touch /tmp/pwned" & "')
+        return answer, spawn
+
+    async def test_macos_dialog(self):
+        answer, spawn = await self.ask("darwin")
+        self.assertEqual(answer, "pa ss")
+        argv, kwargs = spawn.await_args.args, spawn.await_args.kwargs
+        self.assertEqual(argv[0], "/usr/bin/osascript")
+        # The prompt is an argument of the script, not a part of it.
+        self.assertEqual(argv[-1], 'x" & do shell script "touch /tmp/pwned" & "')
+        self.assertFalse(any("touch" in part for part in argv[:-1]))
+        self.assertIn("with hidden answer", " ".join(argv))
+        # stdin and stdout of this server are the MCP channel.
+        self.assertEqual(kwargs["stdin"], self.server.asyncio.subprocess.DEVNULL)
+        self.assertEqual(kwargs["stdout"], self.server.asyncio.subprocess.PIPE)
+
+    async def test_cancel_and_empty_answers_are_none(self):
+        self.assertIsNone((await self.ask("darwin", returncode=1))[0])
+        self.assertIsNone((await self.ask("darwin", out=b"\n"))[0])
+
+    async def test_no_window_without_a_way_to_show_one(self):
+        with mock.patch.object(self.server.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "macOS or zenity"):
+                await self.ask("linux")
 
 
 if __name__ == "__main__":

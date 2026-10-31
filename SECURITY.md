@@ -63,7 +63,12 @@ through custom artifacts someone saved in the console. It starts one host per ca
 and refuses while a collection is still under way there. The platform's own
 second factor still applies: for paths, custom artifacts and the most sensitive
 parts it asks for the user's one-time code unless the token's user has an IP
-allowlist.
+allowlist. With `XDR_PASSWORD_PROMPT` set, the server asks the person at the machine for the
+second factor in a native window and sends it straight to `XDR_BASE_URL`; it is
+not a tool argument, not in a result and not in an error. The window's text is
+passed to it as an argument, not spliced into a script, and shows what is being
+collected from which host, so it doubles as a human confirmation. Without the
+variable a one-time code goes through the chat.
 
 **The API key goes wherever `XDR_BASE_URL` points.** The URL is validated at
 startup — https only, no query or fragment — so the key cannot travel in the
@@ -79,4 +84,5 @@ switch by design. For an internal CA, point `XDR_CA_BUNDLE` at a PEM bundle.
 It makes no network calls other than to `XDR_BASE_URL`, reads no environment
 variables beyond the ones documented in the README, sends no telemetry, and
 writes no files — except downloaded artifacts, only into `XDR_DOWNLOAD_DIR` and
-only when it is set.
+only when it is set. The one process it starts is the password window, and only
+when `XDR_PASSWORD_PROMPT` is set.
