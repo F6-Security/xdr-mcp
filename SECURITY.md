@@ -52,6 +52,19 @@ read that folder can read the artifacts. The tool is hidden unless
 `XDR_DOWNLOAD_DIR` is set, and it writes nowhere else: the file name the API
 sends is reduced to a plain name before use, so it cannot steer the path.
 
+**`xdr_collect_artifacts` acts on a host.** It starts a collection there with
+SYSTEM or root rights, and custom artifacts can carry commands that run as
+part of it. Text that reached the model from a mail body or an event can ask for a
+collection just as it can ask for a matcher, so the collection tools are hidden
+unless `XDR_ALLOW_COLLECT` is set — a switch apart from `XDR_ALLOW_WRITE`, since
+resolving alerts and acting on hosts are different grants. To keep what can run on
+a host in human hands, the tool takes no commands of its own: commands arrive only
+through custom artifacts someone saved in the console. It starts one host per call
+and refuses while a collection is still under way there. The platform's own
+second factor still applies: for paths, custom artifacts and the most sensitive
+parts it asks for the user's one-time code unless the token's user has an IP
+allowlist.
+
 **The API key goes wherever `XDR_BASE_URL` points.** The URL is validated at
 startup — https only, no query or fragment — so the key cannot travel in the
 clear or to a malformed address. It is still sent to whatever host the value

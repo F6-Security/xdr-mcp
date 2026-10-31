@@ -101,6 +101,40 @@ class TestDownloadGate(unittest.TestCase):
         self.assertIn("XDR_DOWNLOAD_DIR", result.content[0].text)
 
 
+class TestCollectGate(unittest.TestCase):
+    """Collecting acts on hosts, so it has a switch of its own, apart from writes."""
+
+    NAMES = ["xdr_list_artifact_presets", "xdr_collect_artifacts", "xdr_abort_artifact_collection"]
+
+    def test_disabled_by_default(self):
+        s = load_server()
+        self.assertFalse(s.ALLOW_COLLECT)
+        for name in self.NAMES:
+            self.assertNotIn(name, [t.name for t in s.TOOLS])
+
+    def test_allowing_writes_does_not_allow_collecting(self):
+        s = load_server(XDR_ALLOW_WRITE="1")
+        self.assertNotIn("xdr_collect_artifacts", [t.name for t in s.TOOLS])
+
+    def test_enabled_by_flag(self):
+        for value in ("1", "true", "yes"):
+            with self.subTest(value=value):
+                s = load_server(XDR_ALLOW_COLLECT=value)
+                self.assertEqual([t.name for t in s.TOOLS][-3:], self.NAMES)
+
+    def test_calling_them_while_disabled_is_refused(self):
+        s = load_server()
+        for name in self.NAMES:
+            with self.subTest(name=name):
+                arguments = {"machine_id": ARTIFACT_ID, "artifacts": ["prefetch"], "report_id": 1}
+                params = s.types.CallToolRequestParams(name=name, arguments=arguments)
+                with mock.patch.object(s, "xdr_request") as request:
+                    result = run(s.on_call_tool(None, params))
+                request.assert_not_called()
+                self.assertTrue(result.is_error)
+                self.assertIn("XDR_ALLOW_COLLECT", result.content[0].text)
+
+
 class TestBaseUrlValidation(unittest.TestCase):
     """A bad base URL must fail the import, not leak the API key on first use."""
 
@@ -402,12 +436,12 @@ class TestValidateMatcher(unittest.TestCase):
 
 
 class TestToolDeclarations(unittest.TestCase):
-    def test_only_the_write_tool_is_marked_destructive(self):
+    def test_only_the_tools_that_act_are_marked_destructive(self):
         with tempfile.TemporaryDirectory() as folder:
-            s = load_server(XDR_ALLOW_WRITE="1", XDR_DOWNLOAD_DIR=folder)
+            s = load_server(XDR_ALLOW_WRITE="1", XDR_DOWNLOAD_DIR=folder, XDR_ALLOW_COLLECT="1")
         for tool in s.TOOLS:
             with self.subTest(tool=tool.name):
-                if tool.name == "xdr_mark_event":
+                if tool.name in ("xdr_mark_event", "xdr_collect_artifacts", "xdr_abort_artifact_collection"):
                     self.assertFalse(tool.annotations.read_only_hint)
                     self.assertTrue(tool.annotations.destructive_hint)
                 elif tool.name == "xdr_download_artifact":
@@ -865,6 +899,355 @@ class TestDownloadArtifact(unittest.IsolatedAsyncioTestCase):
                     await self.download(self.zip_response(b"PK", "a.zip"), **arguments)
         self.assertEqual(self.requests, [])
         self.assertEqual(self.saved(), [])
+
+
+class TestCollectPaths(unittest.TestCase):
+    """A path outside the rules fails the whole collection."""
+
+    def test_windows_paths_that_work(self):
+        for path in (
+            r"C:\Windows\Prefetch",
+            r"C:\Users\*\AppData\Roaming\*\*.exe",
+            r"C:\ProgramData\*-????????-????",
+            r"D:\inetpub\logs",
+        ):
+            with self.subTest(path=path):
+                self.assertIsNone(server.windows_path_problem(path))
+
+    def test_windows_paths_that_break_it(self):
+        cases = {
+            "C:/Windows/Prefetch": "backslashes",
+            r"Windows\Prefetch": "absolute",
+            "C:\\Windows\\Prefetch\\": "backslash",
+            "C:\\": "backslash",
+            r'C:\Program Files\x" -o "C:\evil': '"',
+            r"C:\%TEMP%\x": "%",
+            r"C:\INetCache\update_e[1].jpg": "[",
+            r"C:\ProgramData\????????-*": "only after a *",
+            "C:\\Windows\\Tasks\nC:\\x": "control characters",
+        }
+        for path, expected in cases.items():
+            with self.subTest(path=path):
+                self.assertIn(expected, server.windows_path_problem(path))
+
+    def test_posix_paths_that_work(self):
+        for path in ("/etc/cron.d", "/var/log/*.log", "/home/*/.bash_history", "/var/log/auth.log"):
+            with self.subTest(path=path):
+                self.assertIsNone(server.posix_path_problem(path))
+
+    def test_posix_paths_that_break_it(self):
+        cases = {
+            "etc/cron.d": "absolute",
+            "/srv/$HOME": "$",
+            '/srv/a"b': '"',
+            "/srv/`id`": "`",
+            "/srv/a\\b": "\\",
+            "/srv/a\tb": "control characters",
+        }
+        for path, expected in cases.items():
+            with self.subTest(path=path):
+                self.assertIn(expected, server.posix_path_problem(path))
+
+    def test_nothing_that_takes_in_lastlog(self):
+        # Sparse, and can be very large.
+        for path in ("/var/log/lastlog", "/var/log", "/var/log/", "/var/log/*", "/var", "/", "/*/log/l*"):
+            with self.subTest(path=path):
+                self.assertIn("lastlog", server.posix_path_problem(path))
+        # macOS has no such file, and its /var/log is worth taking.
+        self.assertIsNone(server.posix_path_problem("/var/log", linux=False))
+
+    def test_string_lists(self):
+        self.assertEqual(server.string_list("paths", None, 5), [])
+        self.assertEqual(server.string_list("paths", [" /a ", "/b", "/a"], 5), ["/a", "/b"])
+        for value in ("/a", ["/a", ""], ["/a", " "], [1], {"a": 1}):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "array of non-empty strings"):
+                    server.string_list("paths", value, 5)
+        with self.assertRaisesRegex(ValueError, "at most 2"):
+            server.string_list("paths", ["/a", "/b", "/c"], 2)
+
+
+MACHINE_ID = "0f2b6c1e-58a4-4c3e-9d7a-1b2c3d4e5f60"
+# forensic_options as live cards carry them, per agent type.
+WINDOWS_OPTIONS = [
+    "browser_history", "commands_to_execute", "crash_dumps", "diagnostics", "event_log", "files_to_upload",
+    "hiber_file", "log_file", "master_file_table", "memory_dump", "page_file", "perf_logs", "prefetch",
+    "registry", "temp_dir", "usn_journal", "bugreport",
+]
+LINUX_OPTIONS = [
+    "apparmor_configs", "cron_jobs", "custom_paths", "devices", "dns_resolvers", "dpkg_packages",
+    "executable_commands", "fstab", "groups", "hosts", "init_subsystem", "ip_routes", "kernel_modules",
+    "logged_users", "locks", "memory_info", "mounts", "network_interfaces", "network_tables",
+    "pacman_packages", "rpm_packages", "se_linux_configs", "shadow", "shell_history", "ssh_configs",
+    "sudoers_configs", "system_controls", "unix_sockets", "bugreport",
+]
+MACOS_OPTIONS = [
+    "agent_logs", "custom_paths", "etc", "executable_commands", "logs", "provision_profiles", "shell", "ssh",
+    "startup_items",
+]
+FEATURES = {"collect_artifacts": True, "triage_execute_commands": True, "remote_shell": True}
+
+
+def card(options=WINDOWS_OPTIONS, **fields):
+    # The live card has no unit_type: the type shows only through forensic_options.
+    data = {
+        "id": 42, "machine_id": MACHINE_ID.upper(), "type": "agent", "archived": False, "status": "Online",
+        "current_name": "WS-1", "forensic_options": options, "features": FEATURES,
+    }
+    return {"data": {**data, **fields}}
+
+
+class FakeApi:
+    """Answers the calls a collection makes, and records them."""
+
+    def __init__(self, asset, before=(), after=(), presets=(), post_error=None):
+        self.asset = asset
+        self.reports = [list(before), list(after)]
+        self.presets = list(presets)
+        self.post_error = post_error
+        self.calls = []
+
+    async def __call__(self, method, path, body=None):
+        self.calls.append((method, path, body))
+        if path == "/api/assets/forensic-reports/presets/":
+            return {"data": self.presets}
+        if path.startswith("/api/assets/forensic-reports/?"):
+            # the host's collections before the new one is made, then after
+            rows = self.reports.pop(0) if len(self.reports) > 1 else self.reports[0]
+            return {"data": {"count": len(rows), "results": rows}}
+        if method == "GET" and path.startswith("/api/assets/"):
+            return self.asset
+        if method == "POST" and path == "/api/assets/forensic-reports/":
+            if self.post_error:
+                raise self.post_error
+            return {"data": {"id": 501}}
+        if method == "POST" and path.endswith("/forensic-report/abort/"):
+            return {"messages": ["aborted"]}
+        raise AssertionError(f"unexpected request {method} {path}")
+
+    def posts(self):
+        return [body for method, path, body in self.calls if method == "POST"]
+
+
+class TestCollectArtifacts(unittest.TestCase):
+    """Everything that would make the API or the agent fail quietly is caught before the request."""
+
+    def setUp(self):
+        self.server = load_server(XDR_ALLOW_COLLECT="1")
+
+    def call(self, api, name="xdr_collect_artifacts", **arguments):
+        params = self.server.types.CallToolRequestParams(name=name, arguments=arguments)
+        with mock.patch.object(self.server, "xdr_request", new=api):
+            return run(self.server.on_call_tool(None, params))
+
+    def collect(self, api, **arguments):
+        return self.call(api, machine_id=MACHINE_ID, **arguments)
+
+    def refused(self, api, expected, **arguments):
+        result = self.collect(api, **arguments)
+        self.assertTrue(result.is_error, result.content[0].text)
+        self.assertIn(expected, result.content[0].text)
+        self.assertEqual(api.posts(), [])
+        return result.content[0].text
+
+    def test_a_windows_collection(self):
+        row = {"id": 501, "internal_id": ARTIFACT_ID, "command_status": "New", "need_rotation": False}
+        api = FakeApi(card(), before=[], after=[row])
+        result = self.collect(api, artifacts=["prefetch", "event_log"], paths=[r"C:\Windows\Tasks"])
+        self.assertFalse(result.is_error, result.content[0].text)
+        self.assertEqual(api.calls[0], ("GET", f"/api/assets/{MACHINE_ID}/", None))
+        self.assertEqual(api.posts(), [{
+            "unit_type": "huntpoint",
+            # the card's spelling: the API looks the machine id up as an exact term
+            "asset": MACHINE_ID.upper(),
+            "prefetch": True,
+            "event_log": True,
+            "files_to_upload": [r"C:\Windows\Tasks"],
+        }])
+        self.assertIn('"report_id": 501', result.content[0].text)
+        self.assertIn(f'"internal_id": "{ARTIFACT_ID}"', result.content[0].text)
+        self.assertNotIn("need_rotation", result.content[0].text)
+
+    def test_the_agent_type_comes_from_the_host(self):
+        # A Linux host goes to the API as edr_linux, and its paths as custom_paths.
+        api = FakeApi(card(LINUX_OPTIONS))
+        result = self.collect(api, artifacts=["hosts"], paths=["/etc/cron.d"])
+        self.assertFalse(result.is_error, result.content[0].text)
+        self.assertEqual(api.posts(), [{
+            "unit_type": "edr_linux", "asset": MACHINE_ID.upper(), "hosts": True,
+            "custom_paths": ["/etc/cron.d"],
+        }])
+
+        api = FakeApi(card(MACOS_OPTIONS))
+        self.assertFalse(self.collect(api, artifacts=["etc"]).is_error)
+        self.assertEqual(api.posts()[0]["unit_type"], "edr_macos")
+
+    def test_each_agent_type_has_a_marker_only_it_offers(self):
+        lists = {"huntpoint": WINDOWS_OPTIONS, "edr_linux": LINUX_OPTIONS, "edr_macos": MACOS_OPTIONS}
+        for unit_type, spec in self.server.COLLECT_TARGETS.items():
+            with self.subTest(unit_type=unit_type):
+                holders = [name for name, options in lists.items() if spec["marker"] in options]
+                self.assertEqual(holders, [unit_type])
+
+    def test_a_host_without_an_agent_is_refused(self):
+        # A network host's card has no forensic options at all.
+        for options in (None, [], ["something_else"]):
+            with self.subTest(options=options):
+                self.refused(FakeApi(card(options)), "no EDR agent", artifacts=["prefetch"])
+
+    def test_a_host_with_collection_turned_off_is_refused(self):
+        features = {**FEATURES, "collect_artifacts": False}
+        self.refused(FakeApi(card(features=features)), "turned off", artifacts=["prefetch"])
+
+    def test_an_archived_host_is_refused(self):
+        self.refused(FakeApi(card(archived=True)), "archived", artifacts=["prefetch"])
+
+    def test_an_artifact_of_another_os_is_refused(self):
+        # The API would drop the unknown field and start a collection of nothing.
+        text = self.refused(FakeApi(card()), "not a Windows artifact: shadow", artifacts=["shadow"])
+        self.assertIn("prefetch", text)
+
+    def test_an_artifact_the_agent_does_not_offer_is_refused(self):
+        older = [name for name in WINDOWS_OPTIONS if name != "bugreport"]
+        self.refused(FakeApi(card(options=older)), "does not offer bugreport", artifacts=["bugreport"])
+
+    def test_paths_need_the_agent_to_take_paths(self):
+        options = [name for name in LINUX_OPTIONS if name != "custom_paths"]
+        self.refused(FakeApi(card(options)), "custom_paths", paths=["/etc/cron.d"])
+
+    def test_a_path_outside_the_rules_is_refused(self):
+        self.refused(FakeApi(card()), "backslash", paths=["C:\\Windows\\Tasks\\"])
+        self.refused(FakeApi(card(LINUX_OPTIONS)), "lastlog", paths=["/var/log"])
+
+    def test_a_collection_under_way_blocks_another(self):
+        busy = {"id": 7, "command_status": "Pending", "ts_created": "2026-10-31T10:00:00Z", "user": "A. B."}
+        text = self.refused(FakeApi(card(), before=[busy]), "collection 7", artifacts=["prefetch"])
+        self.assertIn("xdr_abort_artifact_collection", text)
+
+    def test_finished_collections_do_not_block(self):
+        done = [{"id": n, "command_status": status} for n, status in enumerate(("Done", "Failed", "Aborted"))]
+        api = FakeApi(card(), before=done)
+        self.assertFalse(self.collect(api, artifacts=["prefetch"]).is_error)
+        self.assertEqual(len(api.posts()), 1)
+
+    def test_presets_are_looked_up_and_sent(self):
+        presets = [
+            {"id": "p1", "name": "Win · Tasks", "params": {"paths": [r"C:\Windows\Tasks"]}},
+            {"id": "p2", "name": "Win · Hives", "params": {"commands": [r"reg save HKLM\SAM C:\f6ir\SAM"]}},
+        ]
+        api = FakeApi(card(), presets=presets)
+        result = self.collect(api, preset_ids=["p2", "p1"])
+        self.assertFalse(result.is_error, result.content[0].text)
+        self.assertEqual(api.posts()[0]["preset_ids"], ["p2", "p1"])
+        self.assertIn("Win · Hives", result.content[0].text)
+
+    def test_an_unknown_preset_is_refused(self):
+        self.refused(FakeApi(card(), presets=[{"id": "p1"}]), "no custom artifact p9", preset_ids=["p9"])
+
+    def test_preset_commands_need_the_agent_to_take_commands(self):
+        options = [name for name in WINDOWS_OPTIONS if name != "commands_to_execute"]
+        presets = [{"id": "p1", "params": {"commands": ["whoami"]}}]
+        self.refused(
+            FakeApi(card(options=options), presets=presets), "commands_to_execute", preset_ids=["p1"]
+        )
+        # The console hides commands from a host whose agent may not run them.
+        features = {**FEATURES, "triage_execute_commands": False}
+        api = FakeApi(card(features=features), presets=presets)
+        self.refused(api, "not allowed to run commands", preset_ids=["p1"])
+
+    def test_too_long_a_windows_collection_is_refused(self):
+        paths = [rf"C:\Users\*\AppData\Local\Vendor{n:03}\{'x' * 80}" for n in range(80)]
+        self.refused(FakeApi(card()), "over the 8191", paths=paths)
+
+    def test_the_code_is_sent_as_the_password(self):
+        api = FakeApi(card(LINUX_OPTIONS))
+        self.assertFalse(self.collect(api, artifacts=["shell_history"], otp="123456").is_error)
+        self.assertEqual(api.posts()[0]["password"], "123456")
+
+    def test_a_malformed_code_is_refused_before_any_request(self):
+        for otp in ("12ab56", "123", 123456, ""):
+            with self.subTest(otp=otp):
+                api = FakeApi(card())
+                result = self.collect(api, artifacts=["prefetch"], otp=otp)
+                self.assertTrue(result.is_error)
+                self.assertEqual(api.calls, [])
+
+    def test_commands_are_not_taken_directly(self):
+        api = FakeApi(card())
+        result = self.collect(api, commands=["whoami"])
+        self.assertTrue(result.is_error)
+        self.assertIn("preset_ids", result.content[0].text)
+        self.assertEqual(api.calls, [])
+
+    def test_nothing_to_collect_is_refused(self):
+        api = FakeApi(card())
+        result = self.collect(api, artifacts=[], paths=[])
+        self.assertIn("nothing to collect", result.content[0].text)
+        self.assertEqual(api.calls, [])
+
+    def test_a_refused_protected_collection_explains_the_code(self):
+        error = RuntimeError(
+            'API error 400 Bad Request: {"data":[],"errors":[],"messages":[{"message":"wrong code"}]}'
+        )
+        api = FakeApi(card(LINUX_OPTIONS), post_error=error)
+        result = self.collect(api, artifacts=["shell_history"])
+        self.assertTrue(result.is_error)
+        self.assertIn("shell_history", result.content[0].text)
+        self.assertIn("otp", result.content[0].text)
+
+    def test_other_refusals_pass_through_unchanged(self):
+        error = RuntimeError("API error 400 Bad Request: {}")
+        result = self.collect(FakeApi(card(), post_error=error), artifacts=["prefetch"])
+        self.assertTrue(result.is_error)
+        self.assertNotIn("otp", result.content[0].text)
+
+    def abort(self, api, **arguments):
+        return self.call(api, name="xdr_abort_artifact_collection", **{"machine_id": MACHINE_ID, **arguments})
+
+    def test_abort_a_collection_under_way(self):
+        api = FakeApi(card(), before=[{"id": 5, "command_status": "Pending"}])
+        result = self.abort(api, report_id=5)
+        self.assertFalse(result.is_error, result.content[0].text)
+        self.assertEqual(api.posts(), [{}])
+        self.assertEqual(api.calls[-1][1], "/api/assets/forensic-reports/5/forensic-report/abort/")
+
+    def test_a_finished_collection_is_not_aborted(self):
+        # The API takes it and answers that it stopped, and the finished archive
+        # can no longer be read afterwards. Seen on a live installation.
+        for status in ("Done", "Failed", "Aborted"):
+            with self.subTest(status=status):
+                api = FakeApi(card(), before=[{"id": 5, "command_status": status}])
+                result = self.abort(api, report_id=5)
+                self.assertTrue(result.is_error)
+                self.assertIn("not under way", result.content[0].text)
+                self.assertEqual(api.posts(), [])
+
+    def test_a_collection_of_another_host_is_not_aborted(self):
+        api = FakeApi(card(), before=[{"id": 6, "command_status": "Pending"}])
+        result = self.abort(api, report_id=5)
+        self.assertIn("not among the recent collections", result.content[0].text)
+        self.assertEqual(api.posts(), [])
+
+    def test_abort_needs_a_host_and_a_report_id(self):
+        for arguments in ({"report_id": None}, {"report_id": 0}, {"report_id": "5/../x"},
+                          {"report_id": 5, "machine_id": "nope"}):
+            with self.subTest(arguments=arguments):
+                api = FakeApi(card())
+                result = self.abort(api, **arguments)
+                self.assertTrue(result.is_error)
+                self.assertEqual(api.calls, [])
+
+    def test_presets_list_keeps_what_matters_and_filters(self):
+        presets = [
+            {"id": "p1", "name": "Win · Tasks", "description": "", "params": {"paths": ["C:\\x"]},
+             "creator_id": 3, "can_manage": True},
+            {"id": "p2", "name": "Linux · Logs", "description": "auth and syslog", "params": {}},
+        ]
+        result = self.call(FakeApi(card(), presets=presets), name="xdr_list_artifact_presets", search="LOGS")
+        text = result.content[0].text
+        self.assertIn('"count": 1', text)
+        self.assertIn("Linux · Logs", text)
+        self.assertNotIn("creator_id", text)
 
 
 if __name__ == "__main__":
