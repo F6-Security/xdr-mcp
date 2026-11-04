@@ -9,6 +9,7 @@ Run from the repository root:
 """
 
 import importlib
+import json
 import os
 import shutil
 import sys
@@ -402,6 +403,21 @@ class TestValidateMatcher(unittest.TestCase):
 
 
 class TestToolDeclarations(unittest.TestCase):
+    def test_application_versions_is_available_in_all_section_tools(self):
+        s = load_server()
+        # The artifact tools take no section, so only the five section tools carry it.
+        section_tools = [tool for tool in s.TOOLS if "section" in tool.input_schema["properties"]]
+        self.assertEqual(len(section_tools), 5)
+        for tool in section_tools:
+            with self.subTest(tool=tool.name):
+                self.assertIn("application_versions", tool.input_schema["properties"]["section"]["enum"])
+                self.assertTrue(tool.annotations.read_only_hint)
+        search = next(tool for tool in s.TOOLS if tool.name == "xdr_search")
+        self.assertIn(
+            "application_versions: version, ts_created, ts_updated",
+            search.input_schema["properties"]["ordering"]["description"],
+        )
+
     def test_only_the_write_tool_is_marked_destructive(self):
         with tempfile.TemporaryDirectory() as folder:
             s = load_server(XDR_ALLOW_WRITE="1", XDR_DOWNLOAD_DIR=folder)
@@ -622,6 +638,61 @@ class TestToolDispatch(unittest.TestCase):
         request, result = self.call("xdr_get_artifact_structure", {"report_id": 5, "path": "/var/../etc"})
         request.assert_not_awaited()
         self.assertTrue(result.is_error)
+
+    def test_application_versions_routes_all_read_operations(self):
+        self.server = load_server()
+        query = 'software_id: "11111111-1111-4111-8111-111111111111" AND version: "1.2.3"'
+        cases = [
+            ("xdr_search", {"query": ""}, ("POST", "/api/software/versions/check/", {"search": ""})),
+            (
+                "xdr_search", {"query": query, "page_size": 10, "offset": 3, "ordering": "-ts_updated"},
+                ("POST", "/api/software/versions/check/?ordering=-ts_updated&page_size=10&offset=3",
+                 {"search": query}),
+            ),
+            ("xdr_count", {}, ("GET", "/api/software/versions/count/")),
+            ("xdr_count", {"query": query}, ("POST", "/api/software/versions/count/", {"search": query})),
+            ("xdr_get_mapping", {}, ("GET", "/api/software/versions/mapping/")),
+            ("xdr_get_filters", {}, ("GET", "/api/software/versions/filters/")),
+            (
+                "xdr_get_suggestions", {"field": "vendor", "prefix": "Example Corp"},
+                ("GET", "/api/software/versions/search_help/?field=vendor&prefix=Example+Corp"),
+            ),
+        ]
+        for name, arguments, expected in cases:
+            with self.subTest(tool=name, arguments=arguments):
+                request, result = self.call(name, {"section": "application_versions", **arguments})
+                request.assert_awaited_once_with(*expected)
+                self.assertFalse(result.is_error)
+
+    def test_application_versions_preserves_records_and_empty_results(self):
+        self.server = load_server()
+        # The same version on two assets remains two records, with the API's count.
+        records = [
+            {"version": "1.2.3", "machine_id": "test-host-1", "computer_id": "1"},
+            {"version": "1.2.3", "machine_id": "test-host-2", "computer_id": "2"},
+        ]
+        for rows in (records, []):
+            with self.subTest(rows=rows):
+                payload = {"data": {"count": len(rows), "results": rows, "next": None, "previous": None}}
+                params = self.server.types.CallToolRequestParams(
+                    name="xdr_search", arguments={"section": "application_versions", "query": ""},
+                )
+                with mock.patch.object(self.server, "xdr_request", new_callable=mock.AsyncMock) as request:
+                    request.return_value = payload
+                    result = run(self.server.on_call_tool(None, params))
+                request.assert_awaited_once_with("POST", "/api/software/versions/check/", {"search": ""})
+                self.assertFalse(result.is_error)
+                self.assertEqual(json.loads(result.content[0].text), payload)
+
+    def test_applications_still_uses_software_routes(self):
+        for name, expected in (
+            ("xdr_search", ("POST", "/api/software/check/", {"search": ""})),
+            ("xdr_count", ("GET", "/api/software/count/")),
+        ):
+            with self.subTest(tool=name):
+                request, result = self.call(name, {"section": "applications", "query": ""})
+                request.assert_awaited_once_with(*expected)
+                self.assertFalse(result.is_error)
 
     def test_mark_event_sends_the_validated_payload(self):
         payload = {
