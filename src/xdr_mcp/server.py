@@ -4,10 +4,12 @@
 """MCP server for the F6 XDR platform API."""
 
 import asyncio
+import hashlib
 import json
 import os
 import re
 import ssl
+import tempfile
 import uuid
 from typing import Any
 from urllib.parse import quote, urlencode, urlsplit
@@ -406,18 +408,25 @@ def artifact_path(value: Any) -> str:
     return "/" + "/".join(parts)
 
 
-def artifact_file_name(internal_id: str, disposition: str) -> str:
+def artifact_file_name(internal_id: str, disposition: str, path: str = "/") -> str:
     """Build a safe local file name from Content-Disposition.
 
     The API names a part after its full path inside the report
     ("var/log/x.log.zip") and the whole report after a timestamp with colons;
     neither is usable as a file name on every platform as it stands, and the
     header is the server's to choose, so nothing in it may steer the path.
+
+    Only the last name of a part is kept, so two parts with the same name in
+    different folders would land on one file and the second would silently
+    replace the first. A short hash of the path inside the artifact keeps them
+    apart, while a repeated download of the same part still lands on one file.
     """
     match = re.search(r'filename="([^"]*)"', disposition)
     name = match.group(1) if match else ""
     name = name.replace("\\", "/").rsplit("/", 1)[-1]
     name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._") or "artifact.zip"
+    if path != "/":
+        name = f"{hashlib.sha256(path.encode()).hexdigest()[:8]}_{name}"
     return f"{internal_id[:8]}_{name}"
 
 
@@ -510,11 +519,17 @@ async def download_artifact(args: dict[str, Any]) -> dict[str, Any]:
                 )
 
             disposition = response.headers.get("content-disposition", "")
-            target = os.path.join(DOWNLOAD_DIR, artifact_file_name(internal_id, disposition))
-            partial = target + ".part"
+            target = os.path.join(DOWNLOAD_DIR, artifact_file_name(internal_id, disposition, path))
+            # mkstemp creates the file itself: exclusively, under a fresh name and
+            # readable by its owner only. A memory dump is not left readable to
+            # every local user, a link planted in the folder cannot redirect the
+            # write, and two downloads of one part never share a partial file.
+            fd, partial = tempfile.mkstemp(
+                prefix=os.path.basename(target) + ".", suffix=".part", dir=DOWNLOAD_DIR
+            )
             size = 0
             try:
-                with open(partial, "wb") as file:
+                with os.fdopen(fd, "wb") as file:
                     async for chunk in response.aiter_bytes():
                         size += len(chunk)
                         if size > limit:

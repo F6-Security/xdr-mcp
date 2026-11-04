@@ -8,6 +8,7 @@ Run from the repository root:
     ./venv/bin/python -m unittest discover -s tests -v
 """
 
+import hashlib
 import importlib
 import json
 import os
@@ -884,7 +885,48 @@ class TestDownloadArtifact(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             self.requests[0].url.raw_path.endswith(b"/download/%2Fvar%2Flog%2Fsyslog/")
         )
-        self.assertEqual(os.path.basename(result["file"]), f"{ARTIFACT_ID[:8]}_syslog.zip")
+        tag = hashlib.sha256(b"/var/log/syslog").hexdigest()[:8]
+        self.assertEqual(os.path.basename(result["file"]), f"{ARTIFACT_ID[:8]}_{tag}_syslog.zip")
+
+    async def test_parts_with_one_name_in_different_folders_are_kept_apart(self):
+        first = await self.download(
+            self.zip_response(b"PK one", "var/log/syslog.zip"), path="/var/log/syslog"
+        )
+        second = await self.download(
+            self.zip_response(b"PK two", "var/log/old/syslog.zip"), path="/var/log/old/syslog"
+        )
+        self.assertNotEqual(first["file"], second["file"])
+        with open(first["file"], "rb") as file:
+            self.assertEqual(file.read(), b"PK one")
+        self.assertEqual(len(self.saved()), 2)
+
+    async def test_the_same_part_again_replaces_its_file(self):
+        first = await self.download(self.zip_response(b"PK old", "syslog.zip"), path="/var/log/syslog")
+        second = await self.download(self.zip_response(b"PK new", "syslog.zip"), path="/var/log/syslog")
+        self.assertEqual(first["file"], second["file"])
+        with open(second["file"], "rb") as file:
+            self.assertEqual(file.read(), b"PK new")
+        self.assertEqual(self.saved(), [os.path.basename(second["file"])])
+
+    @unittest.skipUnless(os.name == "posix", "file modes are POSIX")
+    async def test_the_saved_file_is_readable_by_its_owner_only(self):
+        result = await self.download(self.zip_response(b"PK", "a.zip"))
+        self.assertEqual(os.stat(result["file"]).st_mode & 0o777, 0o600)
+
+    @unittest.skipUnless(os.name == "posix", "symlinks need POSIX")
+    async def test_a_link_planted_in_the_folder_is_not_followed(self):
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, True)
+        victim = os.path.join(outside, "victim")
+        with open(victim, "wb") as file:
+            file.write(b"untouched")
+        # The name a fixed-name partial file would have had.
+        name = self.server.artifact_file_name(ARTIFACT_ID, 'filename="a.zip"')
+        os.symlink(victim, os.path.join(self.folder, name + ".part"))
+
+        await self.download(self.zip_response(b"PK", "a.zip"))
+        with open(victim, "rb") as file:
+            self.assertEqual(file.read(), b"untouched")
 
     async def test_a_path_not_in_the_artifact(self):
         # The API answers it with a 200 and an empty zip rather than an error.
