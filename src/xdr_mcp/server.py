@@ -4,11 +4,15 @@
 """MCP server for the F6 XDR platform API."""
 
 import asyncio
+import hashlib
 import json
 import os
+import re
 import ssl
+import tempfile
+import uuid
 from typing import Any
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 import httpx
 import mcp_types as types
@@ -31,6 +35,12 @@ MAX_ERROR_CHARS = 512
 # xdr_mark_event writes to the platform, so it is opt-in: without XDR_ALLOW_WRITE
 # the server advertises the read-only tools only.
 ALLOW_WRITE = os.environ.get("XDR_ALLOW_WRITE", "").strip().lower() in ("1", "true", "yes")
+
+# Collected artifacts run from a few kilobytes of logs to memory dumps of many
+# gigabytes, so a download is capped unless the caller asks for more.
+DEFAULT_ARTIFACT_PAGE_SIZE = 20
+DEFAULT_DOWNLOAD_MB = 2048
+MAX_DOWNLOAD_MB = 100 * 1024
 
 
 def _validated_base_url() -> str:
@@ -70,9 +80,28 @@ def _verification() -> ssl.SSLContext | bool:
         raise RuntimeError(f"XDR_CA_BUNDLE could not be loaded: {error}") from error
 
 
+def _download_dir() -> str:
+    """Resolve the folder xdr_download_artifact saves into.
+
+    The tool is opt-in, like xdr_mark_event: without XDR_DOWNLOAD_DIR it is not
+    advertised. Artifacts can hold a host's memory, credentials or shell
+    history, so where they land is the operator's choice rather than a default
+    the server picks. A folder that does not exist fails the server on startup,
+    not on the first download.
+    """
+    raw = os.environ.get("XDR_DOWNLOAD_DIR", "").strip()
+    if not raw:
+        return ""
+    path = os.path.abspath(os.path.expanduser(raw))
+    if not os.path.isdir(path):
+        raise RuntimeError(f"XDR_DOWNLOAD_DIR is not a directory: {raw}")
+    return path
+
+
 BASE_URL = _validated_base_url()
 API_KEY = (os.environ.get("XDR_API_KEY") or "").strip()
 VERIFY = _verification()
+DOWNLOAD_DIR = _download_dir()
 
 
 async def xdr_request(method: str, path: str, body: Any = None) -> Any:
@@ -189,6 +218,10 @@ SECTIONS: dict[str, dict[str, Any]] = {
         "path": "software", "countPath": "software",
         "ordering": ("name", "ts_created", "ts_updated"),
     },
+    "application_versions": {
+        "path": "software/versions", "countPath": "software/versions",
+        "ordering": ("version", "ts_created", "ts_updated"),
+    },
 }
 
 ALL_SECTIONS = list(SECTIONS.keys())
@@ -242,11 +275,17 @@ QUERY_DESCRIPTION = (
     "Call xdr_get_mapping for the fields a section accepts, xdr_get_filters for the values an "
     "enumerated field takes, and xdr_get_suggestions to look up the exact spelling of a value — a "
     "value outside the accepted set returns zero results rather than an error. "
-    "Time filtering uses the timestamp field, relative (timestamp >= now-1d, now-6h) or absolute "
+    "Time filtering uses fields from xdr_get_mapping, typically timestamp, with relative "
+    "(timestamp >= now-1d, now-6h) or absolute values "
     '(timestamp >= "2024-01-01T00:00:00.000+03:00"). The calendar-rounding forms now/d, now/w and '
     "now/M return nothing, so use now-1d and the like. Note that timestamp is a search field: the "
     "ordering parameter takes an entirely different set of names. "
     'For the "applications" section, filter by asset, e.g. (asset: "<machine_id>"). '
+    'The "application_versions" section returns per-asset software version records. '
+    'Filter by software_id: "<uuid from applications>" (supported even though absent from mapping), '
+    'version: "1.2.3", or asset: "<machine_id or exact current_name>" identifying a single asset. '
+    'For dates in this section use first_seen or last_seen, e.g. last_seen >= now-7d; '
+    'ordering uses version, ts_created or ts_updated. '
     "A query the API cannot parse is not rejected — it is treated as free text, so verify that "
     "the results match what you asked for."
 )
@@ -333,6 +372,192 @@ def validate_matcher(payload: Any, fields: set[str] = MATCHER_FIELDS, require_co
     return payload
 
 
+# Collected artifacts, "forensic reports" in the API: what an analyst gathers
+# from a host — logs, configs, a bug report, a memory dump — kept by the
+# platform as one zip per collection. Fields kept from a list row; the rest is
+# bookkeeping the model has no use for.
+ARTIFACT_FIELDS = (
+    "id", "internal_id", "ts_created", "asset_id", "asset_name", "machine_id", "asset_status",
+    "asset_version", "parts", "command_status", "upload_progress", "size", "user", "error",
+)
+ARTIFACT_ORDERINGS = ("-ts_created", "ts_created")
+
+# What the download endpoint answers for a path that is not in the report: a
+# 200 with an empty zip, the end-of-central-directory record alone, and no file
+# name. Verified against a live installation.
+EMPTY_ZIP_BYTES = 22
+
+
+def as_uuid(name: str, value: Any) -> str:
+    """Validate a UUID argument; it goes into a URL path, so nothing else may."""
+    try:
+        return str(uuid.UUID(str(value)))
+    except ValueError as error:
+        raise ValueError(f"{name} must be a UUID, got {value!r}") from error
+
+
+def artifact_path(value: Any) -> str:
+    """Normalise a path inside an artifact to '/a/b' form, '/' for all of it."""
+    if value is None:
+        return "/"
+    if not isinstance(value, str):
+        raise ValueError("path must be a string")
+    parts = [part for part in value.replace("\\", "/").split("/") if part]
+    if ".." in parts:
+        raise ValueError("path must not contain '..'")
+    return "/" + "/".join(parts)
+
+
+def artifact_file_name(internal_id: str, disposition: str, path: str = "/") -> str:
+    """Build a safe local file name from Content-Disposition.
+
+    The API names a part after its full path inside the report
+    ("var/log/x.log.zip") and the whole report after a timestamp with colons;
+    neither is usable as a file name on every platform as it stands, and the
+    header is the server's to choose, so nothing in it may steer the path.
+
+    Only the last name of a part is kept, so two parts with the same name in
+    different folders would land on one file and the second would silently
+    replace the first. A short hash of the path inside the artifact keeps them
+    apart, while a repeated download of the same part still lands on one file.
+    """
+    match = re.search(r'filename="([^"]*)"', disposition)
+    name = match.group(1) if match else ""
+    name = name.replace("\\", "/").rsplit("/", 1)[-1]
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._") or "artifact.zip"
+    if path != "/":
+        name = f"{hashlib.sha256(path.encode()).hexdigest()[:8]}_{name}"
+    return f"{internal_id[:8]}_{name}"
+
+
+async def list_artifacts(args: dict[str, Any]) -> dict[str, Any]:
+    asset_id = args.get("asset_id")
+    if asset_id is not None:
+        asset_id = as_int("asset_id", asset_id, 1)
+    elif args.get("machine_id"):
+        # Checked as a UUID but sent as given: agents report it in upper case and
+        # the card is looked up with a term query. Only the canonical 36-character
+        # form passes, so nothing but hex digits and dashes reaches the URL.
+        machine_id = str(args["machine_id"]).strip()
+        if as_uuid("machine_id", machine_id) != machine_id.lower():
+            raise ValueError(f"machine_id must be a UUID, got {machine_id!r}")
+        # The list ignores a machine_id filter and returns every report, so the
+        # asset card turns it into the asset id the list does filter on.
+        asset = await xdr_request("GET", f"/api/assets/{machine_id}/")
+        asset_id = (asset.get("data") or {}).get("id")
+        if not asset_id:
+            raise LookupError(f"no asset with machine_id {machine_id}")
+
+    page = as_int("page", args.get("page", 1), 1)
+    page_size = as_int("page_size", args.get("page_size", DEFAULT_ARTIFACT_PAGE_SIZE), 1, MAX_PAGE_SIZE)
+    ordering = args.get("ordering") or "-ts_created"
+    if ordering not in ARTIFACT_ORDERINGS:
+        raise ValueError(f"ordering must be one of: {', '.join(ARTIFACT_ORDERINGS)}")
+
+    # This endpoint pages by page number under the name "cursor"; "page" and
+    # "offset" are ignored and bring back the first page again.
+    qs = build_query_string(
+        {"asset_id": asset_id, "ordering": ordering, "cursor": page, "page_size": page_size}
+    )
+    result = await xdr_request("GET", f"/api/assets/forensic-reports/{qs}")
+    data = result.get("data") or {}
+    return {
+        "count": data.get("count"),
+        "page": page,
+        "next_page": data.get("next"),
+        "results": [{key: row.get(key) for key in ARTIFACT_FIELDS} for row in data.get("results") or []],
+    }
+
+
+async def get_artifact_structure(args: dict[str, Any]) -> dict[str, Any]:
+    report_id = as_int("report_id", args.get("report_id"), 1)
+    path = artifact_path(args.get("path"))
+    qs = build_query_string({"path": path if path != "/" else None})
+    result = await xdr_request(
+        "GET", f"/api/assets/forensic-reports/{report_id}/forensic-report/structure/{qs}"
+    )
+    return {"report_id": report_id, "path": path, "entries": result.get("data")}
+
+
+async def download_artifact(args: dict[str, Any]) -> dict[str, Any]:
+    """Stream an artifact, or one part of it, as a zip into DOWNLOAD_DIR.
+
+    Only the saved path and size go back to the model: the content itself stays
+    on disk, out of the context.
+    """
+    if not BASE_URL or not API_KEY:
+        raise RuntimeError("XDR_BASE_URL and XDR_API_KEY environment variables must be set")
+
+    internal_id = as_uuid("internal_id", args.get("internal_id"))
+    path = artifact_path(args.get("path"))
+    max_mb = as_int("max_mb", args.get("max_mb", DEFAULT_DOWNLOAD_MB), 1, MAX_DOWNLOAD_MB)
+    limit = max_mb * 1024 * 1024
+
+    # The path travels as a single URL segment, slashes included ("/" becomes
+    # %2F) — the way the console's own download link spells it.
+    url = f"{BASE_URL}/api/assets/forensic-reports/{internal_id}/download/{quote(path, safe='')}/"
+    headers = {"x-api-key": API_KEY, "User-Agent": USER_AGENT}
+
+    # The read timeout applies per chunk rather than to the whole transfer, so a
+    # large report that keeps streaming is not cut off.
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(60.0, read=600.0), trust_env=False, follow_redirects=False, verify=VERIFY
+    ) as client:
+        async with client.stream("GET", url, headers=headers) as response:
+            content_type = response.headers.get("content-type", "")
+            # An unknown route is answered with the console's HTML page and a
+            # 200, so the content type is checked as well as the status.
+            if not response.is_success or not content_type.startswith("application/octet-stream"):
+                detail = ""
+                if content_type.startswith("application/json"):
+                    detail = (await response.aread()).decode("utf-8", "replace")[:MAX_ERROR_CHARS]
+                suffix = f": {detail}" if detail else ""
+                raise RuntimeError(
+                    f"API error {response.status_code} ({content_type or 'no content type'}){suffix}"
+                )
+
+            declared = response.headers.get("content-length", "")
+            if declared.isdigit() and int(declared) > limit:
+                raise RuntimeError(
+                    f"the artifact is {int(declared)} bytes, over max_mb={max_mb}; raise max_mb or "
+                    f"pick a smaller path with xdr_get_artifact_structure"
+                )
+
+            disposition = response.headers.get("content-disposition", "")
+            target = os.path.join(DOWNLOAD_DIR, artifact_file_name(internal_id, disposition, path))
+            # mkstemp creates the file itself: exclusively, under a fresh name and
+            # readable by its owner only. A memory dump is not left readable to
+            # every local user, a link planted in the folder cannot redirect the
+            # write, and two downloads of one part never share a partial file.
+            fd, partial = tempfile.mkstemp(
+                prefix=os.path.basename(target) + ".", suffix=".part", dir=DOWNLOAD_DIR
+            )
+            size = 0
+            try:
+                with os.fdopen(fd, "wb") as file:
+                    async for chunk in response.aiter_bytes():
+                        size += len(chunk)
+                        if size > limit:
+                            raise RuntimeError(
+                                f"the download passed max_mb={max_mb} and was stopped; raise max_mb "
+                                f"or pick a smaller path with xdr_get_artifact_structure"
+                            )
+                        file.write(chunk)
+            except BaseException:
+                if os.path.exists(partial):
+                    os.remove(partial)
+                raise
+
+    if size == EMPTY_ZIP_BYTES and 'filename=""' in disposition:
+        os.remove(partial)
+        raise FileNotFoundError(
+            f"nothing at {path} in artifact {internal_id}; see xdr_get_artifact_structure"
+        )
+
+    os.replace(partial, target)
+    return {"internal_id": internal_id, "path": path, "file": target, "bytes": size}
+
+
 READ_ONLY_ANNOTATIONS = types.ToolAnnotations(readOnlyHint=True, openWorldHint=True)
 
 SECTION_PROPERTY = {"type": "string", "description": SECTION_DESCRIPTION, "enum": ALL_SECTIONS}
@@ -413,6 +638,43 @@ MARK_EVENT_TOOL = types.Tool(
     },
 )
 
+DOWNLOAD_ARTIFACT_TOOL = types.Tool(
+    name="xdr_download_artifact",
+    description=(
+        "Download a collected artifact, or one file or folder inside it, as a zip into the folder "
+        "set by XDR_DOWNLOAD_DIR, and return where it was saved and its size. The content is not "
+        "returned. Takes 'internal_id' (UUID) from xdr_list_artifacts; 'path' is a file or folder "
+        "inside the artifact as xdr_get_artifact_structure shows it (e.g. /var/log/syslog), and the "
+        "default '/' is the whole artifact. Artifacts can be many gigabytes: the download is refused "
+        "or stopped above max_mb, so pick the part you need instead of raising it. Reads from XDR "
+        "only; the one thing it writes is the local file."
+    ),
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "internal_id": {
+                "type": "string",
+                "description": "Artifact UUID ('internal_id' in xdr_list_artifacts)",
+            },
+            "path": {
+                "type": "string",
+                "description": "File or folder inside the artifact; default '/' (all of it)",
+            },
+            "max_mb": {
+                "type": "integer", "minimum": 1, "maximum": MAX_DOWNLOAD_MB,
+                "description": f"Size cap in MiB (default {DEFAULT_DOWNLOAD_MB})",
+            },
+        },
+        "required": ["internal_id"],
+    },
+)
+
 TOOLS = [
     types.Tool(
         name="xdr_search",
@@ -436,7 +698,8 @@ TOOLS = [
         name="xdr_count",
         description=(
             "Get the total count of records in an XDR section. "
-            "Optionally filter by query to count matching records only."
+            "Optionally filter by query to count matching records only. "
+            "For application_versions this counts per-asset records, not distinct version strings."
         ),
         annotations=READ_ONLY_ANNOTATIONS,
         inputSchema={
@@ -504,7 +767,64 @@ TOOLS = [
             "required": ["section"],
         },
     ),
+    types.Tool(
+        name="xdr_list_artifacts",
+        description=(
+            "List artifacts collected from hosts — what an analyst gathered through the asset's "
+            "Response → Artifacts: bug reports, logs, configs, memory dumps. Filter by host with "
+            "asset_id (the asset's numeric id) or machine_id; with neither, lists artifacts across "
+            "all hosts. Newest first by default. Each row has 'id' (for xdr_get_artifact_structure), "
+            "'internal_id' (for xdr_download_artifact), 'parts' (what was collected), "
+            "'command_status' (New, Queued, Pending, Uploading, Uploaded, Done, Failed) and 'size' "
+            "in bytes."
+        ),
+        annotations=READ_ONLY_ANNOTATIONS,
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "asset_id": {"type": "integer", "minimum": 1, "description": "Numeric asset id"},
+                "machine_id": {
+                    "type": "string",
+                    "description": "Agent machine id (UUID); looked up to the asset id first",
+                },
+                "ordering": {
+                    "type": "string",
+                    "enum": list(ARTIFACT_ORDERINGS),
+                    "description": "By creation time; default -ts_created (newest first)",
+                },
+                "page": {"type": "integer", "minimum": 1, "description": "1-based page number"},
+                "page_size": {
+                    "type": "integer", "minimum": 1, "maximum": MAX_PAGE_SIZE,
+                    "description": f"Rows per page (1-{MAX_PAGE_SIZE}, default {DEFAULT_ARTIFACT_PAGE_SIZE})",
+                },
+            },
+        },
+    ),
+    types.Tool(
+        name="xdr_get_artifact_structure",
+        description=(
+            "List the files and folders inside a collected artifact, one level at a time, with their "
+            "sizes. Takes the artifact's numeric 'id' from xdr_list_artifacts and an optional folder "
+            "inside it (e.g. /var/log). Use it to find the part worth downloading rather than "
+            "fetching a whole artifact."
+        ),
+        annotations=READ_ONLY_ANNOTATIONS,
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "report_id": {
+                    "type": "integer", "minimum": 1,
+                    "description": "Numeric artifact id ('id' in xdr_list_artifacts)",
+                },
+                "path": {"type": "string", "description": "Folder inside the artifact; omit for the top"},
+            },
+            "required": ["report_id"],
+        },
+    ),
 ]
+
+if DOWNLOAD_DIR:
+    TOOLS.append(DOWNLOAD_ARTIFACT_TOOL)
 
 if ALLOW_WRITE:
     TOOLS.append(MARK_EVENT_TOOL)
@@ -564,6 +884,19 @@ async def on_call_tool(
         elif name == "xdr_get_filters":
             section = get_section(args.get("section"))
             result = await xdr_request("GET", f"/api/{section['path']}/filters/")
+
+        elif name == "xdr_list_artifacts":
+            result = await list_artifacts(args)
+
+        elif name == "xdr_get_artifact_structure":
+            result = await get_artifact_structure(args)
+
+        elif name == "xdr_download_artifact":
+            if not DOWNLOAD_DIR:
+                raise PermissionError(
+                    "xdr_download_artifact is disabled. Set XDR_DOWNLOAD_DIR to a folder to enable it."
+                )
+            result = await download_artifact(args)
 
         elif name == "xdr_mark_event":
             if not ALLOW_WRITE:

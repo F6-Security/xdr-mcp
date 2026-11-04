@@ -24,13 +24,16 @@ searchable in the platform's own query language.
 | `xdr_get_mapping` | Fields available for search |
 | `xdr_get_filters` | Values available for filters |
 | `xdr_get_suggestions` | Real values of a field, by prefix |
+| `xdr_list_artifacts` | Artifacts collected from hosts: bug reports, logs, configs, dumps |
+| `xdr_get_artifact_structure` | Files and folders inside a collected artifact |
+| `xdr_download_artifact` | Download an artifact, or part of it, into a local folder |
 | `xdr_mark_event` | Mark an object: resolve an alert, flag a false positive |
 
 Sections: `alerts`, `incidents`, `emails`, `files`, `events`, `connections`,
-`assets`, `modules`, `audit`, `applications`.
+`assets`, `modules`, `audit`, `applications`, `application_versions`.
 
-The first five tools only read. `xdr_mark_event` changes data and is off by
-default — see Security below.
+The first seven tools only read. `xdr_download_artifact` writes files to disk and
+`xdr_mark_event` changes data; both are off by default — see Security below.
 
 ## Quick start
 
@@ -70,6 +73,7 @@ container — `docker run -i --rm -e XDR_BASE_URL -e XDR_API_KEY ghcr.io/f6-secu
 | `XDR_BASE_URL` | Address of your XDR installation |
 | `XDR_API_KEY` | Personal API token |
 | `XDR_ALLOW_WRITE` | `1` enables `xdr_mark_event`. Off by default |
+| `XDR_DOWNLOAD_DIR` | Folder `xdr_download_artifact` saves artifacts into; setting it enables the tool. In a container, a path inside a mounted volume |
 | `XDR_CA_BUNDLE` | PEM bundle for an installation behind an internal CA |
 
 ## Example queries
@@ -85,13 +89,37 @@ audit         success : "false" AND timestamp >= now-7d
 ```
 
 Conditions combine with `AND`, `OR`, `NOT` and group with parentheses. Time
-filtering uses the `timestamp` field, relative (`now-1d`, `now-6h`) or absolute.
-`xdr_get_mapping` lists the fields a section accepts.
+filtering usually uses the `timestamp` field, with relative (`now-1d`, `now-6h`)
+or absolute values. `xdr_get_mapping` lists the fields a section accepts;
+`application_versions` uses `first_seen` and `last_seen` for dates.
 
 A string value may contain `*` in any position: `name : "VDI-5*"`,
 `file_name : "*.exe"`. Without one it has to match exactly. When a query returns nothing
 and the value may be spelled differently, `xdr_get_suggestions` gives the real spelling:
 the platform answers an unmatched value with zero records rather than an error.
+
+### Software versions
+
+`applications` returns software, while `application_versions` returns records
+of its versions on assets. Find the software in `applications` first, then use
+its `uuid` as `software_id`:
+
+```
+application_versions  software_id : "<software_uuid>"
+application_versions  software_id : "<software_uuid>" AND version : "1.2.3"
+application_versions  asset : "<machine_id>" AND last_seen >= now-7d
+```
+
+Search supports `software_id` even though `xdr_get_mapping` does not expose it.
+The `asset` field accepts a `machine_id` or exact `current_name` identifying
+a single asset. Results include `version`, `uuid`, `ts_created`, `ts_updated`
+and asset details such as `machine_id` and `computer_name`.
+
+All five tools that take a section support it. Pagination uses `page_size` and
+`offset`; ordering accepts `version`, `ts_created`, `ts_updated` with an optional
+`-` prefix. `xdr_count` counts version records on assets: the same version may
+occur on multiple assets. The `version` field has `show_suggestions=false`,
+so an empty suggestions list is valid.
 
 ## Security
 
@@ -103,6 +131,13 @@ token with the narrowest rights that make the task possible.
 expression, which this tool cannot undo. That is why it is off by default; enable
 `XDR_ALLOW_WRITE` deliberately and keep it out of your MCP client's auto-approve
 list.
+
+Collected artifacts are among the most sensitive data on the platform: memory
+dumps, credentials, command history. `xdr_download_artifact` puts them on disk and
+returns only the path and size to the model — the content never enters the
+context. The tool is enabled only when `XDR_DOWNLOAD_DIR` is set; choose a folder
+with restricted access. Listing and downloading need a token with rights to
+artifacts.
 
 The threat model and how to report a vulnerability are in
 [SECURITY.md](https://github.com/F6-Security/xdr-mcp/blob/HEAD/SECURITY.md).
