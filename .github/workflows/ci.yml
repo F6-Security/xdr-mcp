@@ -71,10 +71,12 @@ jobs:
               server.wait(timeout=10)
 
           assert tools is not None, "no tools/list response"
-          # xdr_mark_event must stay hidden unless XDR_ALLOW_WRITE is set, and
-          # xdr_download_artifact unless XDR_DOWNLOAD_DIR is.
+          # xdr_mark_event must stay hidden unless XDR_ALLOW_WRITE is set,
+          # xdr_download_artifact unless XDR_DOWNLOAD_DIR is, and the collection
+          # tools unless XDR_ALLOW_COLLECT is.
           assert "xdr_mark_event" not in tools, tools
           assert "xdr_download_artifact" not in tools, tools
+          assert "xdr_collect_artifacts" not in tools, tools
           assert len(tools) == 7, tools
           print("handshake OK:", tools)
           PY

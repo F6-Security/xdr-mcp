@@ -27,13 +27,17 @@ searchable in the platform's own query language.
 | `xdr_list_artifacts` | Artifacts collected from hosts: bug reports, logs, configs, dumps |
 | `xdr_get_artifact_structure` | Files and folders inside a collected artifact |
 | `xdr_download_artifact` | Download an artifact, or part of it, into a local folder |
+| `xdr_list_artifact_presets` | Custom artifacts: lists of paths and commands saved in the console |
+| `xdr_collect_artifacts` | Start collecting artifacts from a host |
+| `xdr_abort_artifact_collection` | Stop a collection that is still under way |
 | `xdr_mark_event` | Mark an object: resolve an alert, flag a false positive |
 
 Sections: `alerts`, `incidents`, `emails`, `files`, `events`, `connections`,
 `assets`, `modules`, `audit`, `applications`, `application_versions`.
 
-The first seven tools only read. `xdr_download_artifact` writes files to disk and
-`xdr_mark_event` changes data; both are off by default — see Security below.
+The first seven tools only read. `xdr_download_artifact` writes files to disk,
+`xdr_mark_event` changes data, and the three collection tools act on hosts; all of
+them are off by default — see Security below.
 
 ## Quick start
 
@@ -73,6 +77,8 @@ container — `docker run -i --rm -e XDR_BASE_URL -e XDR_API_KEY ghcr.io/f6-secu
 | `XDR_BASE_URL` | Address of your XDR installation |
 | `XDR_API_KEY` | Personal API token |
 | `XDR_ALLOW_WRITE` | `1` enables `xdr_mark_event`. Off by default |
+| `XDR_ALLOW_COLLECT` | `1` enables collecting artifacts from hosts: `xdr_collect_artifacts`, `xdr_abort_artifact_collection` and `xdr_list_artifact_presets`. Off by default |
+| `XDR_PASSWORD_PROMPT` | `1`: when the console asks for the second factor for protected parts of a collection, the server asks you for it in a window of its own (macOS or zenity) and sends it straight to the console, past the model. Off by default |
 | `XDR_DOWNLOAD_DIR` | Folder `xdr_download_artifact` saves artifacts into; setting it enables the tool. In a container, a path inside a mounted volume |
 | `XDR_CA_BUNDLE` | PEM bundle for an installation behind an internal CA |
 
@@ -138,6 +144,22 @@ returns only the path and size to the model — the content never enters the
 context. The tool is enabled only when `XDR_DOWNLOAD_DIR` is set; choose a folder
 with restricted access. Listing and downloading need a token with rights to
 artifacts.
+
+`xdr_collect_artifacts` starts a collection on a host with SYSTEM or root rights.
+It loads the host, and custom artifacts can carry commands that run there. That is
+why the collection tools have a switch of their own, `XDR_ALLOW_COLLECT`, rather
+than `XDR_ALLOW_WRITE`. The tool takes no arbitrary commands, only custom artifacts
+a person saved in the console. One host per call; there is no bulk start. Paths are
+checked before the request, since a path outside the rules fails the whole
+collection. For paths, custom artifacts, the bug report, memory dumps, command
+history and a few other parts the platform asks for a one-time code unless the
+token's user has an IP allowlist. With `XDR_PASSWORD_PROMPT=1` the server asks you
+for it in a window of its own and sends it straight to the console: the model never
+sees it, and the window shows what is being collected from which host. Without it
+the model asks you for the code in the chat. Only a
+collection still under way can be stopped: the platform takes an abort for a
+finished one too, and its archive can no longer be read afterwards. Keep the
+collection tools out of your MCP client's auto-approve list.
 
 The threat model and how to report a vulnerability are in
 [SECURITY.md](https://github.com/F6-Security/xdr-mcp/blob/HEAD/SECURITY.md).

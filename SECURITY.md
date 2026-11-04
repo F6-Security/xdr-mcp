@@ -54,6 +54,32 @@ sends is reduced to a plain name before use, so it cannot steer the path. Each
 file is created readable by its owner only, under a name nothing else in the
 folder can claim first, so a link planted there cannot redirect the write.
 
+**`xdr_collect_artifacts` acts on a host.** It starts a collection there with
+SYSTEM or root rights, and custom artifacts can carry commands that run as
+part of it. Text that reached the model from a mail body or an event can ask for a
+collection just as it can ask for a matcher, so the collection tools are hidden
+unless `XDR_ALLOW_COLLECT` is set — a switch apart from `XDR_ALLOW_WRITE`, since
+resolving alerts and acting on hosts are different grants. To keep what can run on
+a host in human hands, the tool takes no commands of its own: commands arrive only
+through custom artifacts someone saved in the console. It starts one host per call
+and refuses while a collection is still under way there. The platform's own
+second factor still applies: for paths, custom artifacts and the most sensitive
+parts it asks for the user's one-time code unless the token's user has an IP
+allowlist. With `XDR_PASSWORD_PROMPT` set, the server asks the person at the machine for the
+second factor in a native window and sends it straight to `XDR_BASE_URL`; it is
+not a tool argument, not in a result and not in an error. The window's text is
+passed to it as an argument, not spliced into a script, and shows what is being
+collected from which host, so it doubles as a human confirmation. Without the
+variable a one-time code goes through the chat; the platform would take that code
+again for a minute and a half, so the server lets one code go with one collection
+only.
+
+The second factor is waived for a token whose user has an IP allowlist, and for a
+request from an address the user's account trusts. With such a token nothing on
+the platform's side asks a person before a collection starts: the only check left
+is the MCP client's own confirmation of each tool call. Enable `XDR_ALLOW_COLLECT`
+with such a token only where every call is confirmed by hand.
+
 **The API key goes wherever `XDR_BASE_URL` points.** The URL is validated at
 startup — https only, no query or fragment — so the key cannot travel in the
 clear or to a malformed address. It is still sent to whatever host the value
@@ -68,4 +94,5 @@ switch by design. For an internal CA, point `XDR_CA_BUNDLE` at a PEM bundle.
 It makes no network calls other than to `XDR_BASE_URL`, reads no environment
 variables beyond the ones documented in the README, sends no telemetry, and
 writes no files — except downloaded artifacts, only into `XDR_DOWNLOAD_DIR` and
-only when it is set.
+only when it is set. The one process it starts is the password window, and only
+when `XDR_PASSWORD_PROMPT` is set.

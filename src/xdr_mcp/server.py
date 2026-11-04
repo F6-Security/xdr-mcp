@@ -4,12 +4,16 @@
 """MCP server for the F6 XDR platform API."""
 
 import asyncio
+import fnmatch
 import hashlib
 import json
 import os
 import re
+import shutil
 import ssl
+import sys
 import tempfile
+import time
 import uuid
 from typing import Any
 from urllib.parse import quote, urlencode, urlsplit
@@ -35,6 +39,26 @@ MAX_ERROR_CHARS = 512
 # xdr_mark_event writes to the platform, so it is opt-in: without XDR_ALLOW_WRITE
 # the server advertises the read-only tools only.
 ALLOW_WRITE = os.environ.get("XDR_ALLOW_WRITE", "").strip().lower() in ("1", "true", "yes")
+
+# Starting a collection acts on a host, as SYSTEM or root and with whatever
+# commands the chosen custom artifacts carry. That is a different
+# thing from marking alerts, so it has a switch of its own: a setup that lets the
+# model resolve alerts has not thereby agreed to it acting on hosts.
+ALLOW_COLLECT = os.environ.get("XDR_ALLOW_COLLECT", "").strip().lower() in ("1", "true", "yes")
+
+# With XDR_PASSWORD_PROMPT the second factor a protected collection needs goes
+# from the person at this machine straight to the API: when the API turns the
+# collection down, the server asks for it in a window of its own. The model never
+# sees it, since it is not an argument, not in a result and not in an error.
+PASSWORD_PROMPT = os.environ.get("XDR_PASSWORD_PROMPT", "").strip().lower() in ("1", "true", "yes")
+PASSWORD_PROMPT_SECONDS = 120
+
+# A one-time code the user types into the chat stays valid for about a minute and
+# a half, and the platform takes the same code again within that time. The model
+# could carry it to a second collection the user never asked for, so here a code
+# goes with one collection only.
+OTP_REUSE_SECONDS = 180
+USED_OTPS: dict[str, float] = {}
 
 # Collected artifacts run from a few kilobytes of logs to memory dumps of many
 # gigabytes, so a download is capped unless the caller asks for more.
@@ -558,6 +582,455 @@ async def download_artifact(args: dict[str, Any]) -> dict[str, Any]:
     return {"internal_id": internal_id, "path": path, "file": target, "bytes": size}
 
 
+# Starting a collection, the console's Response → Collect artifacts. The agent
+# type goes to the API as unit_type and comes from the host, never from the
+# caller. The asset card does not carry unit_type, but its forensic_options lists
+# what the host's agent type offers, and each type's list has a name no other one
+# has: the marker below. An artifact name the API does not know would be dropped
+# without a word, so names are checked here rather than collected as nothing.
+COLLECT_TARGETS: dict[str, dict[str, Any]] = {
+    "huntpoint": {
+        "os": "Windows",
+        "marker": "files_to_upload",
+        "paths_field": "files_to_upload",
+        "commands_field": "commands_to_execute",
+        "artifacts": (
+            "browser_history", "bugreport", "certutil", "crash_dumps", "diagnostics", "event_log",
+            "handles", "hiber_file", "log_file", "master_file_table", "memory_dump", "page_file",
+            "perf_logs", "powershell_console_history", "prefetch", "recent_file_cache", "recent_files",
+            "registry", "scheduler_tasks", "srum", "sum", "temp_dir", "usn_journal",
+        ),
+    },
+    "edr_linux": {
+        "os": "Linux",
+        "marker": "dpkg_packages",
+        "paths_field": "custom_paths",
+        "commands_field": "executable_commands",
+        "artifacts": (
+            "apparmor_configs", "bugreport", "cron_jobs", "devices", "dns_resolvers", "dpkg_packages",
+            "fstab", "groups", "hosts", "init_subsystem", "ip_routes", "kernel_modules", "locks",
+            "logged_users", "memory_info", "mounts", "network_interfaces", "network_tables",
+            "pacman_packages", "rpm_packages", "se_linux_configs", "shadow", "shell_history",
+            "ssh_configs", "sudoers_configs", "system_controls", "unix_sockets",
+        ),
+    },
+    "edr_macos": {
+        "os": "macOS",
+        "marker": "provision_profiles",
+        "paths_field": "custom_paths",
+        "commands_field": "executable_commands",
+        "artifacts": (
+            "agent_logs", "bugreport", "etc", "logs", "provision_profiles", "shell", "ssh", "startup_items",
+        ),
+    },
+}
+COLLECT_ARGUMENTS = {"machine_id", "artifacts", "paths", "preset_ids", "otp"}
+
+# Parts the API guards with the user's second factor, the code from their
+# authenticator app. It waives the code for a personal token whose user has an
+# IP allowlist and asks for it otherwise.
+PROTECTED_PARTS = frozenset({
+    "bugreport", "custom_paths", "files_to_upload", "hiber_file", "memory_dump", "network_tables",
+    "page_file", "preset_ids", "shadow", "shell_history", "ssh_configs", "sudoers_configs",
+})
+
+# A collection in one of these is still under way, and a host takes one at a time.
+COLLECTION_IN_FLIGHT = ("New", "Queued", "Pending", "Uploading")
+
+# Limits and path rules for one collection. A path outside them fails the whole
+# collection, not just that path.
+MAX_COLLECT_ITEMS = 256
+MAX_PRESETS = 100
+WINDOWS_LENGTH_LIMIT = 8191
+WINDOWS_LENGTH_RESERVED = 500
+WINDOWS_PATH = re.compile(r"[A-Za-z]:\\[^/]*")
+POSIX_UNSAFE_CHARS = frozenset('$"`\\')
+LASTLOG = ("var", "log", "lastlog")
+
+
+def windows_path_problem(path: str) -> str | None:
+    if any(ord(char) < 32 for char in path):
+        return "must not contain control characters"
+    if not WINDOWS_PATH.fullmatch(path):
+        return r"must be absolute and use backslashes, like C:\Windows\Prefetch"
+    if path.endswith("\\"):
+        return "must not end with a backslash"
+    if '"' in path or "%" in path:
+        return 'must not contain " or %'
+    if "[" in path or "]" in path:
+        return "must not contain [ or ]; take the folder instead"
+    seen_star = False
+    for part in path.split("\\"):
+        if "?" in part and not seen_star and "*" not in part.split("?")[0]:
+            return "may use ? only after a *"
+        seen_star = seen_star or "*" in part
+    return None
+
+
+def posix_path_problem(path: str, linux: bool = True) -> str | None:
+    if any(ord(char) < 32 for char in path):
+        return "must not contain control characters"
+    if not path.startswith("/"):
+        return "must be absolute"
+    bad = sorted(set(path) & POSIX_UNSAFE_CHARS)
+    if bad:
+        return f"must not contain {' '.join(bad)}"
+    parts = [part for part in path.split("/") if part]
+    if linux and len(parts) <= len(LASTLOG) and all(
+        fnmatch.fnmatchcase(name, part) for part, name in zip(parts, LASTLOG, strict=False)
+    ):
+        # lastlog is a sparse file and can be very large.
+        return "takes in /var/log/lastlog, which can be very large; name the logs instead"
+    return None
+
+
+def string_list(name: str, value: Any, limit: int) -> list[str]:
+    """A list of non-empty strings, trimmed, with repeats dropped."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+        raise ValueError(f"{name} must be an array of non-empty strings")
+    items = list(dict.fromkeys(item.strip() for item in value))
+    if len(items) > limit:
+        raise ValueError(f"{name} takes at most {limit} entries, got {len(items)}")
+    return items
+
+
+async def artifact_presets() -> list[dict[str, Any]]:
+    """Custom artifacts the token's user can see: stored lists of paths or commands."""
+    result = await xdr_request("GET", "/api/assets/forensic-reports/presets/")
+    rows = result.get("data") if isinstance(result, dict) else result
+    presets = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        params = row.get("params") or {}
+        presets.append({
+            "id": row.get("id"),
+            "name": row.get("name"),
+            "description": row.get("description"),
+            "commands": params.get("commands") or [],
+            "paths": params.get("paths") or [],
+            "company_ids": row.get("company_ids") or [],
+        })
+    return presets
+
+
+async def list_artifact_presets(args: dict[str, Any]) -> dict[str, Any]:
+    search = args.get("search")
+    if search is not None and not isinstance(search, str):
+        raise ValueError("search must be a string")
+    presets = await artifact_presets()
+    if search and search.strip():
+        needle = search.strip().casefold()
+        presets = [
+            preset for preset in presets
+            if needle in f"{preset['name'] or ''}\n{preset['description'] or ''}".casefold()
+        ]
+    return {"count": len(presets), "presets": presets}
+
+
+def api_message(error: Exception) -> str:
+    """The console's own message out of an "API error ...: {json}" text, or ''."""
+    text = str(error)
+    start = text.find("{")
+    try:
+        body = json.loads(text[start:]) if start >= 0 else {}
+    except ValueError:
+        return ""
+    messages = body.get("messages") if isinstance(body, dict) else None
+    return "; ".join(
+        str(item.get("message") or "") for item in messages or [] if isinstance(item, dict)
+    ).strip()
+
+
+async def ask_password(prompt: str) -> str | None:
+    """Ask the person at this machine for a secret in a window of its own.
+
+    The prompt goes in as an argument, never into the script itself, so nothing
+    in it can run. The window's own process has no stdin and its stdout is a
+    pipe: this server's stdio is the MCP channel. None if they cancel, or let
+    the window time out.
+    """
+    if sys.platform == "darwin":
+        argv = [
+            "/usr/bin/osascript",
+            "-e", "on run argv",
+            "-e", (
+                'set answer to display dialog (item 1 of argv) default answer "" with hidden answer '
+                'with title "F6 XDR" buttons {"Отмена", "Отправить"} default button "Отправить" '
+                f'cancel button "Отмена" with icon caution giving up after {PASSWORD_PROMPT_SECONDS}'
+            ),
+            "-e", "if gave up of answer then error number -128",
+            "-e", "return text returned of answer",
+            "-e", "end run",
+            prompt,
+        ]
+    elif shutil.which("zenity"):
+        # zenity reads Pango markup in --text
+        text = prompt.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        argv = [
+            "zenity", "--entry", "--hide-text", "--title=F6 XDR", f"--text={text}",
+            f"--timeout={PASSWORD_PROMPT_SECONDS}",
+        ]
+    else:
+        raise RuntimeError("XDR_PASSWORD_PROMPT needs macOS or zenity to show a password window")
+
+    process = await asyncio.create_subprocess_exec(
+        *argv,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        out, _ = await asyncio.wait_for(process.communicate(), PASSWORD_PROMPT_SECONDS + 15)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        return None
+    if process.returncode != 0:
+        return None
+    secret = out.decode("utf-8", "replace")
+    secret = secret[:-1] if secret.endswith("\n") else secret
+    return secret or None
+
+
+async def post_collection(body: dict[str, Any], what: str) -> dict[str, Any]:
+    """Create the collection; with XDR_PASSWORD_PROMPT, get the second factor from a window if asked.
+
+    The first request goes without it. The API checks the second factor before
+    it looks the host up, so a refused request has created nothing, and a token
+    that needs no code is never asked for one.
+    """
+    try:
+        return await xdr_request("POST", "/api/assets/forensic-reports/", body)
+    except RuntimeError as error:
+        protected = sorted(PROTECTED_PARTS & set(body))
+        if not protected or not str(error).startswith("API error 400"):
+            raise
+        if PASSWORD_PROMPT and "password" not in body:
+            message = api_message(error)
+            secret = await ask_password(
+                f"Сбор артефактов: {what}.\n\n"
+                + (f"Консоль: «{message}».\n\n" if message else "")
+                + "Введите одноразовый код или пароль, который просит консоль. "
+                "Он уйдёт прямо в консоль, модель его не увидит."
+            )
+            if not secret:
+                raise RuntimeError(
+                    f"{error}. The user closed the password window, so nothing was collected"
+                ) from None
+            try:
+                retry = {**body, "password": secret}
+                return await xdr_request("POST", "/api/assets/forensic-reports/", retry)
+            except RuntimeError as retry_error:
+                if api_message(retry_error) != message:
+                    raise  # the second factor was taken; this is some other refusal
+                raise RuntimeError(
+                    f"{retry_error}. The console turned down what the user typed in the window, so nothing "
+                    f"was collected. Calling again asks once more; three wrong codes lock the user out for "
+                    f"five minutes"
+                ) from None
+        raise RuntimeError(
+            f"{error}. This collection includes parts the platform guards with the user's second factor "
+            f"({', '.join(protected)}). If the message is about the code, ask the user for the current "
+            f"code from their authenticator app and call again with otp; three wrong codes lock them out "
+            f"for five minutes"
+        ) from error
+
+
+async def recent_collections(asset_id: int) -> list[dict[str, Any]]:
+    qs = build_query_string({"asset_id": asset_id, "ordering": "-ts_created", "cursor": 1, "page_size": 10})
+    result = await xdr_request("GET", f"/api/assets/forensic-reports/{qs}")
+    return (result.get("data") or {}).get("results") or []
+
+
+async def collect_artifacts(args: dict[str, Any]) -> dict[str, Any]:
+    """Start a collection on one host after checking it against the host's card.
+
+    Everything that would make the collection fail quietly is caught before
+    the request: a wrong agent type, an artifact the host does not offer, a
+    path outside the rules, a second collection while one is under way.
+    """
+    unknown = sorted(set(args) - COLLECT_ARGUMENTS)
+    if unknown:
+        raise ValueError(
+            f"unsupported argument(s): {', '.join(unknown)}. Allowed: "
+            f"{', '.join(sorted(COLLECT_ARGUMENTS))}. Commands are not taken directly: run them through "
+            f"a custom artifact (preset_ids)"
+        )
+    machine_id = as_uuid("machine_id", args.get("machine_id"))
+    artifacts = string_list("artifacts", args.get("artifacts"), MAX_COLLECT_ITEMS)
+    paths = string_list("paths", args.get("paths"), MAX_COLLECT_ITEMS)
+    preset_ids = string_list("preset_ids", args.get("preset_ids"), MAX_PRESETS)
+    if not (artifacts or paths or preset_ids):
+        raise ValueError("nothing to collect: name at least one artifact, path or preset")
+    otp = args.get("otp")
+    if otp is not None and (not isinstance(otp, str) or not re.fullmatch(r"\d{6,8}", otp)):
+        raise ValueError("otp must be the 6-8 digit code from the user's authenticator app")
+    if otp:
+        now = time.monotonic()
+        for code, used_at in list(USED_OTPS.items()):
+            if now - used_at > OTP_REUSE_SECONDS:
+                del USED_OTPS[code]
+        if otp in USED_OTPS:
+            raise ValueError(
+                "this one-time code has already gone with a collection; ask the user for the current one"
+            )
+
+    card = (await xdr_request("GET", f"/api/assets/{machine_id}/")).get("data") or {}
+    asset_id = card.get("id")
+    if not asset_id:
+        raise LookupError(f"no asset with machine_id {machine_id}")
+    offered = card.get("forensic_options")
+    if not isinstance(offered, list):
+        offered = []
+    unit_type, target = next(
+        ((name, spec) for name, spec in COLLECT_TARGETS.items() if spec["marker"] in offered), (None, None)
+    )
+    if target is None:
+        raise ValueError(f"asset {machine_id} has no EDR agent to collect artifacts from")
+    if card.get("archived"):
+        raise ValueError(f"asset {machine_id} is archived, and the platform does not collect from it")
+    features = card.get("features") if isinstance(card.get("features"), dict) else {}
+    if features.get("collect_artifacts") is False:
+        raise ValueError(f"collecting artifacts is turned off for the agent on {machine_id}")
+    os_name = target["os"]
+
+    wrong = [name for name in artifacts if name not in target["artifacts"]]
+    if wrong:
+        raise ValueError(
+            f"not a {os_name} artifact: {', '.join(wrong)}. {os_name} has: {', '.join(target['artifacts'])}"
+        )
+    for path in paths:
+        if os_name == "Windows":
+            problem = windows_path_problem(path)
+        else:
+            problem = posix_path_problem(path, linux=os_name == "Linux")
+        if problem:
+            raise ValueError(f"path {path!r} {problem}")
+
+    presets: list[dict[str, Any]] = []
+    if preset_ids:
+        by_id = {preset["id"]: preset for preset in await artifact_presets()}
+        missing = [preset_id for preset_id in preset_ids if preset_id not in by_id]
+        if missing:
+            raise ValueError(
+                f"no custom artifact {', '.join(missing)} visible to this token; "
+                f"see xdr_list_artifact_presets"
+            )
+        presets = [by_id[preset_id] for preset_id in preset_ids]
+
+    # The platform merges presets into the request, repeats dropped; the limits
+    # apply to the merged lists.
+    commands = list(dict.fromkeys(command for preset in presets for command in preset["commands"]))
+    all_paths = list(dict.fromkeys(paths + [path for preset in presets for path in preset["paths"]]))
+    for name, items in (("paths", all_paths), ("commands", commands)):
+        if len(items) > MAX_COLLECT_ITEMS:
+            raise ValueError(
+                f"{len(items)} {name} with the presets merged in, over the {MAX_COLLECT_ITEMS} "
+                f"one collection takes"
+            )
+    if os_name == "Windows":
+        # Roughly the size of the paths and commands together.
+        length = WINDOWS_LENGTH_RESERVED + sum(len(path) + 3 for path in all_paths) + sum(
+            len(command) + command.count('"') + 3 for command in commands
+        )
+        if length > WINDOWS_LENGTH_LIMIT:
+            raise ValueError(
+                f"the paths and commands come to about {length} characters, over the "
+                f"{WINDOWS_LENGTH_LIMIT} one Windows collection takes; split it into several"
+            )
+
+    needed = list(artifacts)
+    if all_paths:
+        needed.append(target["paths_field"])
+    if commands:
+        needed.append(target["commands_field"])
+    lacking = [name for name in needed if name not in offered]
+    if lacking:
+        raise ValueError(
+            f"the agent on this host does not offer {', '.join(lacking)}; it offers: {', '.join(offered)}"
+        )
+    if commands and features.get("triage_execute_commands") is False:
+        raise ValueError("the agent on this host is not allowed to run commands, and the presets carry some")
+
+    busy = next((row for row in await recent_collections(asset_id)
+                 if row.get("command_status") in COLLECTION_IN_FLIGHT), None)
+    if busy:
+        raise RuntimeError(
+            f"collection {busy.get('id')} on this host is still {busy.get('command_status')} (started "
+            f"{busy.get('ts_created')} by {busy.get('user')}), and a host takes one at a time. "
+            f"Wait for it, or stop it with xdr_abort_artifact_collection"
+        )
+
+    # The card's own spelling of the machine id: the API looks it up as an exact term.
+    body: dict[str, Any] = {"unit_type": unit_type, "asset": card.get("machine_id") or machine_id}
+    body.update(dict.fromkeys(artifacts, True))
+    if paths:
+        body[target["paths_field"]] = paths
+    if preset_ids:
+        body["preset_ids"] = preset_ids
+    if otp:
+        body["password"] = otp
+        USED_OTPS[otp] = time.monotonic()
+
+    host = card.get("alias") or card.get("current_name") or body["asset"]
+    what = list(artifacts)
+    if paths:
+        what.append("пути " + ", ".join(paths[:5]) + (f" и ещё {len(paths) - 5}" if len(paths) > 5 else ""))
+    if presets:
+        what.append("пользовательские артефакты " + ", ".join(f"«{preset['name']}»" for preset in presets))
+    # The host name comes from the agent, so a host can call itself anything; the
+    # machine id beside it is the platform's own.
+    created = await post_collection(body, f"{host} ({os_name}), {body['asset']} — {'; '.join(what)}")
+
+    report_id = (created.get("data") or {}).get("id")
+    row = next((row for row in await recent_collections(asset_id) if row.get("id") == report_id), None)
+    return {
+        "report_id": report_id,
+        "machine_id": body["asset"],
+        "host": card.get("alias") or card.get("current_name"),
+        "os": os_name,
+        "host_status": card.get("status"),
+        "requested": {
+            "artifacts": artifacts,
+            "paths": paths,
+            "presets": [preset["name"] for preset in presets],
+        },
+        "collection": {key: row.get(key) for key in ARTIFACT_FIELDS} if row else None,
+        "next": (
+            "Follow it with xdr_list_artifacts by machine_id; command_status goes New, Queued or Pending, "
+            "Uploading, then Done or Failed. A host that is offline picks the collection up when it is back."
+        ),
+    }
+
+
+async def abort_collection(args: dict[str, Any]) -> dict[str, Any]:
+    """Stop a collection, only one of the given host's and only while it is under way.
+
+    The API also takes an abort for a collection that has finished and answers
+    that it was stopped. It stops nothing, and afterwards the archive's
+    structure can no longer be read while the list still shows Done (seen on a
+    live installation). A mistyped id would do that to someone's collection.
+    """
+    machine_id = as_uuid("machine_id", args.get("machine_id"))
+    report_id = as_int("report_id", args.get("report_id"), 1)
+    asset_id = ((await xdr_request("GET", f"/api/assets/{machine_id}/")).get("data") or {}).get("id")
+    if not asset_id:
+        raise LookupError(f"no asset with machine_id {machine_id}")
+    row = next((row for row in await recent_collections(asset_id) if row.get("id") == report_id), None)
+    if row is None:
+        raise LookupError(f"collection {report_id} is not among the recent collections of {machine_id}")
+    if row.get("command_status") not in COLLECTION_IN_FLIGHT:
+        raise ValueError(
+            f"collection {report_id} is {row.get('command_status')}, not under way, so there is nothing to "
+            f"stop; an abort would only leave its archive unreadable"
+        )
+    result = await xdr_request("POST", f"/api/assets/forensic-reports/{report_id}/forensic-report/abort/", {})
+    return {"report_id": report_id, "result": result}
+
+
 READ_ONLY_ANNOTATIONS = types.ToolAnnotations(readOnlyHint=True, openWorldHint=True)
 
 SECTION_PROPERTY = {"type": "string", "description": SECTION_DESCRIPTION, "enum": ALL_SECTIONS}
@@ -675,6 +1148,137 @@ DOWNLOAD_ARTIFACT_TOOL = types.Tool(
     },
 )
 
+COLLECT_ARTIFACTS_TOOL = types.Tool(
+    name="xdr_collect_artifacts",
+    description=(
+        "Start collecting artifacts from one host — the console's Response → Collect artifacts. The "
+        "agent gathers them with SYSTEM or root rights and uploads one zip, which xdr_list_artifacts, "
+        "xdr_get_artifact_structure and xdr_download_artifact then reach. Start one only when the user "
+        "has asked for this host: it loads the host and goes into the audit log under the token's user. "
+        "Takes the host's 'machine_id' and at least one of: "
+        "'artifacts', named sets per OS — "
+        + "; ".join(f"{t['os']}: {', '.join(t['artifacts'])}" for t in COLLECT_TARGETS.values())
+        + " (an older agent offers fewer; the host's card is checked); "
+        "'paths', files or folders to take (Windows: absolute with backslashes, no trailing backslash, "
+        "[ and ] are not allowed, ? only after a *; Linux and macOS: absolute, without $ \" ` or "
+        "backslash; * works within one path component and a folder is taken whole); 'preset_ids', "
+        "custom artifacts from xdr_list_artifact_presets, stored lists of paths or commands made in the "
+        "console — their commands run on the host. Arbitrary commands are not taken. memory_dump, "
+        "page_file and hiber_file run to gigabytes. The platform asks for the user's one-time code for "
+        + ", ".join(sorted(PROTECTED_PARTS - {"custom_paths", "files_to_upload", "preset_ids"}))
+        + ", paths and presets, unless the token's user has an IP allowlist. "
+        + (
+            "When it asks, this server asks the user for it in a window of its own and sends it straight "
+            "to the console. Do not ask for it in the chat and do not pass otp; if the user closes the "
+            "window, nothing is collected. "
+            if PASSWORD_PROMPT else
+            "When it asks, ask the user for the current code and pass it as 'otp'. Never guess it: three "
+            "wrong codes lock the user out for five minutes. "
+        )
+        + "A host takes one collection at a time, so "
+        "this refuses while one is still under way there. Returns the new collection's id."
+    ),
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        # A preset's commands can change the host.
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+    inputSchema={
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "machine_id": {
+                "type": "string",
+                "description": "Agent machine id (UUID) of the host, as in the assets section",
+            },
+            "artifacts": {
+                "type": "array",
+                "uniqueItems": True,
+                "items": {
+                    "type": "string",
+                    "enum": sorted({name for t in COLLECT_TARGETS.values() for name in t["artifacts"]}),
+                },
+                "description": "Named artifacts; only the host's OS's names apply",
+            },
+            "paths": {
+                "type": "array",
+                "maxItems": MAX_COLLECT_ITEMS,
+                "items": {"type": "string", "minLength": 1},
+                "description": r"Files or folders on the host, e.g. C:\Windows\Tasks or /etc/cron.d",
+            },
+            "preset_ids": {
+                "type": "array",
+                "maxItems": MAX_PRESETS,
+                "items": {"type": "string", "minLength": 1},
+                "description": "Custom artifact ids from xdr_list_artifact_presets",
+            },
+            "otp": {
+                "type": "string",
+                "pattern": "^[0-9]{6,8}$",
+                "description": "The user's current one-time code, only when the platform asks for it",
+            },
+        },
+        "required": ["machine_id"],
+    },
+)
+
+LIST_ARTIFACT_PRESETS_TOOL = types.Tool(
+    name="xdr_list_artifact_presets",
+    description=(
+        "List custom artifacts for xdr_collect_artifacts: named lists of paths to take or commands to "
+        "run on a host, made in the console. Each has 'id', 'name', 'description', 'commands' and "
+        "'paths'. A custom artifact has no OS field, so tell the OS by its name and contents. Several "
+        "chosen together are merged into one collection."
+    ),
+    annotations=READ_ONLY_ANNOTATIONS,
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "search": {
+                "type": "string",
+                "description": "Keep only those whose name or description contains this (any case)",
+            },
+        },
+    },
+)
+
+ABORT_COLLECTION_TOOL = types.Tool(
+    name="xdr_abort_artifact_collection",
+    description=(
+        "Stop a collection that is still under way (command_status New, Queued, Pending or Uploading). "
+        "Takes the host's 'machine_id' and the collection's numeric 'id' from xdr_list_artifacts or "
+        "xdr_collect_artifacts; it refuses a collection of another host or one that has finished, since "
+        "the platform would take that abort too and leave the finished archive unreadable. A small "
+        "collection can finish within a minute, and one that finishes as the abort arrives may lose its "
+        "archive the same way. What the agent has not yet uploaded is lost, so stop only a collection "
+        "the user wants stopped."
+    ),
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "machine_id": {
+                "type": "string",
+                "description": "Agent machine id (UUID) of the host the collection runs on",
+            },
+            "report_id": {
+                "type": "integer", "minimum": 1,
+                "description": "Numeric collection id ('id' in xdr_list_artifacts)",
+            },
+        },
+        "required": ["machine_id", "report_id"],
+    },
+)
+
+COLLECT_TOOLS = [LIST_ARTIFACT_PRESETS_TOOL, COLLECT_ARTIFACTS_TOOL, ABORT_COLLECTION_TOOL]
+
 TOOLS = [
     types.Tool(
         name="xdr_search",
@@ -775,7 +1379,7 @@ TOOLS = [
             "asset_id (the asset's numeric id) or machine_id; with neither, lists artifacts across "
             "all hosts. Newest first by default. Each row has 'id' (for xdr_get_artifact_structure), "
             "'internal_id' (for xdr_download_artifact), 'parts' (what was collected), "
-            "'command_status' (New, Queued, Pending, Uploading, Uploaded, Done, Failed) and 'size' "
+            "'command_status' (New, Queued, Pending, Uploading, Uploaded, Done, Failed, Aborted) and 'size' "
             "in bytes."
         ),
         annotations=READ_ONLY_ANNOTATIONS,
@@ -825,6 +1429,9 @@ TOOLS = [
 
 if DOWNLOAD_DIR:
     TOOLS.append(DOWNLOAD_ARTIFACT_TOOL)
+
+if ALLOW_COLLECT:
+    TOOLS.extend(COLLECT_TOOLS)
 
 if ALLOW_WRITE:
     TOOLS.append(MARK_EVENT_TOOL)
@@ -897,6 +1504,18 @@ async def on_call_tool(
                     "xdr_download_artifact is disabled. Set XDR_DOWNLOAD_DIR to a folder to enable it."
                 )
             result = await download_artifact(args)
+
+        elif name in (tool.name for tool in COLLECT_TOOLS):
+            if not ALLOW_COLLECT:
+                raise PermissionError(
+                    f"{name} is disabled. Set XDR_ALLOW_COLLECT=1 to enable collecting artifacts from hosts."
+                )
+            if name == "xdr_list_artifact_presets":
+                result = await list_artifact_presets(args)
+            elif name == "xdr_collect_artifacts":
+                result = await collect_artifacts(args)
+            else:
+                result = await abort_collection(args)
 
         elif name == "xdr_mark_event":
             if not ALLOW_WRITE:
