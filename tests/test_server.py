@@ -594,7 +594,8 @@ class TestToolDispatch(unittest.TestCase):
         self.assertEqual(
             request.await_args_list,
             [
-                mock.call("GET", f"/api/assets/{ARTIFACT_ID}/"),
+                # sent as the agent reports it, not normalised to lower case
+                mock.call("GET", f"/api/assets/{ARTIFACT_ID.upper()}/"),
                 mock.call(
                     "GET",
                     "/api/assets/forensic-reports/?asset_id=42&ordering=-ts_created&cursor=1&page_size=20",
@@ -618,6 +619,10 @@ class TestToolDispatch(unittest.TestCase):
         for arguments in (
             {"ordering": "-size"},
             {"machine_id": "not-a-uuid"},
+            # uuid.UUID accepts these spellings; none of them may reach the URL
+            {"machine_id": "{" + ARTIFACT_ID + "}"},
+            {"machine_id": "urn:uuid:" + ARTIFACT_ID},
+            {"machine_id": ARTIFACT_ID.replace("-", "")},
             {"asset_id": 0},
             {"page_size": 100000},
         ):

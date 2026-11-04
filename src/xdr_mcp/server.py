@@ -435,7 +435,12 @@ async def list_artifacts(args: dict[str, Any]) -> dict[str, Any]:
     if asset_id is not None:
         asset_id = as_int("asset_id", asset_id, 1)
     elif args.get("machine_id"):
-        machine_id = as_uuid("machine_id", args["machine_id"])
+        # Checked as a UUID but sent as given: agents report it in upper case and
+        # the card is looked up with a term query. Only the canonical 36-character
+        # form passes, so nothing but hex digits and dashes reaches the URL.
+        machine_id = str(args["machine_id"]).strip()
+        if as_uuid("machine_id", machine_id) != machine_id.lower():
+            raise ValueError(f"machine_id must be a UUID, got {machine_id!r}")
         # The list ignores a machine_id filter and returns every report, so the
         # asset card turns it into the asset id the list does filter on.
         asset = await xdr_request("GET", f"/api/assets/{machine_id}/")
