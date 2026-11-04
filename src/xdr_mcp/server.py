@@ -5,12 +5,14 @@
 
 import asyncio
 import fnmatch
+import hashlib
 import json
 import os
 import re
 import shutil
 import ssl
 import sys
+import tempfile
 import uuid
 from typing import Any
 from urllib.parse import quote, urlencode, urlsplit
@@ -232,6 +234,10 @@ SECTIONS: dict[str, dict[str, Any]] = {
         "path": "software", "countPath": "software",
         "ordering": ("name", "ts_created", "ts_updated"),
     },
+    "application_versions": {
+        "path": "software/versions", "countPath": "software/versions",
+        "ordering": ("version", "ts_created", "ts_updated"),
+    },
 }
 
 ALL_SECTIONS = list(SECTIONS.keys())
@@ -285,11 +291,17 @@ QUERY_DESCRIPTION = (
     "Call xdr_get_mapping for the fields a section accepts, xdr_get_filters for the values an "
     "enumerated field takes, and xdr_get_suggestions to look up the exact spelling of a value — a "
     "value outside the accepted set returns zero results rather than an error. "
-    "Time filtering uses the timestamp field, relative (timestamp >= now-1d, now-6h) or absolute "
+    "Time filtering uses fields from xdr_get_mapping, typically timestamp, with relative "
+    "(timestamp >= now-1d, now-6h) or absolute values "
     '(timestamp >= "2024-01-01T00:00:00.000+03:00"). The calendar-rounding forms now/d, now/w and '
     "now/M return nothing, so use now-1d and the like. Note that timestamp is a search field: the "
     "ordering parameter takes an entirely different set of names. "
     'For the "applications" section, filter by asset, e.g. (asset: "<machine_id>"). '
+    'The "application_versions" section returns per-asset software version records. '
+    'Filter by software_id: "<uuid from applications>" (supported even though absent from mapping), '
+    'version: "1.2.3", or asset: "<machine_id or exact current_name>" identifying a single asset. '
+    'For dates in this section use first_seen or last_seen, e.g. last_seen >= now-7d; '
+    'ordering uses version, ts_created or ts_updated. '
     "A query the API cannot parse is not rejected — it is treated as free text, so verify that "
     "the results match what you asked for."
 )
@@ -412,18 +424,25 @@ def artifact_path(value: Any) -> str:
     return "/" + "/".join(parts)
 
 
-def artifact_file_name(internal_id: str, disposition: str) -> str:
+def artifact_file_name(internal_id: str, disposition: str, path: str = "/") -> str:
     """Build a safe local file name from Content-Disposition.
 
     The API names a part after its full path inside the report
     ("var/log/x.log.zip") and the whole report after a timestamp with colons;
     neither is usable as a file name on every platform as it stands, and the
     header is the server's to choose, so nothing in it may steer the path.
+
+    Only the last name of a part is kept, so two parts with the same name in
+    different folders would land on one file and the second would silently
+    replace the first. A short hash of the path inside the artifact keeps them
+    apart, while a repeated download of the same part still lands on one file.
     """
     match = re.search(r'filename="([^"]*)"', disposition)
     name = match.group(1) if match else ""
     name = name.replace("\\", "/").rsplit("/", 1)[-1]
     name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._") or "artifact.zip"
+    if path != "/":
+        name = f"{hashlib.sha256(path.encode()).hexdigest()[:8]}_{name}"
     return f"{internal_id[:8]}_{name}"
 
 
@@ -432,7 +451,12 @@ async def list_artifacts(args: dict[str, Any]) -> dict[str, Any]:
     if asset_id is not None:
         asset_id = as_int("asset_id", asset_id, 1)
     elif args.get("machine_id"):
-        machine_id = as_uuid("machine_id", args["machine_id"])
+        # Checked as a UUID but sent as given: agents report it in upper case and
+        # the card is looked up with a term query. Only the canonical 36-character
+        # form passes, so nothing but hex digits and dashes reaches the URL.
+        machine_id = str(args["machine_id"]).strip()
+        if as_uuid("machine_id", machine_id) != machine_id.lower():
+            raise ValueError(f"machine_id must be a UUID, got {machine_id!r}")
         # The list ignores a machine_id filter and returns every report, so the
         # asset card turns it into the asset id the list does filter on.
         asset = await xdr_request("GET", f"/api/assets/{machine_id}/")
@@ -516,11 +540,17 @@ async def download_artifact(args: dict[str, Any]) -> dict[str, Any]:
                 )
 
             disposition = response.headers.get("content-disposition", "")
-            target = os.path.join(DOWNLOAD_DIR, artifact_file_name(internal_id, disposition))
-            partial = target + ".part"
+            target = os.path.join(DOWNLOAD_DIR, artifact_file_name(internal_id, disposition, path))
+            # mkstemp creates the file itself: exclusively, under a fresh name and
+            # readable by its owner only. A memory dump is not left readable to
+            # every local user, a link planted in the folder cannot redirect the
+            # write, and two downloads of one part never share a partial file.
+            fd, partial = tempfile.mkstemp(
+                prefix=os.path.basename(target) + ".", suffix=".part", dir=DOWNLOAD_DIR
+            )
             size = 0
             try:
-                with open(partial, "wb") as file:
+                with os.fdopen(fd, "wb") as file:
                     async for chunk in response.aiter_bytes():
                         size += len(chunk)
                         if size > limit:
@@ -1252,7 +1282,8 @@ TOOLS = [
         name="xdr_count",
         description=(
             "Get the total count of records in an XDR section. "
-            "Optionally filter by query to count matching records only."
+            "Optionally filter by query to count matching records only. "
+            "For application_versions this counts per-asset records, not distinct version strings."
         ),
         annotations=READ_ONLY_ANNOTATIONS,
         inputSchema={

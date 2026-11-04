@@ -50,7 +50,9 @@ metadata in the model's context — file names, sizes, who collected what.
 size, so the content itself does not reach the model provider; but whatever can
 read that folder can read the artifacts. The tool is hidden unless
 `XDR_DOWNLOAD_DIR` is set, and it writes nowhere else: the file name the API
-sends is reduced to a plain name before use, so it cannot steer the path.
+sends is reduced to a plain name before use, so it cannot steer the path. Each
+file is created readable by its owner only, under a name nothing else in the
+folder can claim first, so a link planted there cannot redirect the write.
 
 **`xdr_collect_artifacts` acts on a host.** It starts a collection there with
 SYSTEM or root rights, and custom artifacts can carry commands that run as

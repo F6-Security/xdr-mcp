@@ -8,7 +8,9 @@ Run from the repository root:
     ./venv/bin/python -m unittest discover -s tests -v
 """
 
+import hashlib
 import importlib
+import json
 import os
 import shutil
 import sys
@@ -436,6 +438,21 @@ class TestValidateMatcher(unittest.TestCase):
 
 
 class TestToolDeclarations(unittest.TestCase):
+    def test_application_versions_is_available_in_all_section_tools(self):
+        s = load_server()
+        # The artifact tools take no section, so only the five section tools carry it.
+        section_tools = [tool for tool in s.TOOLS if "section" in tool.input_schema["properties"]]
+        self.assertEqual(len(section_tools), 5)
+        for tool in section_tools:
+            with self.subTest(tool=tool.name):
+                self.assertIn("application_versions", tool.input_schema["properties"]["section"]["enum"])
+                self.assertTrue(tool.annotations.read_only_hint)
+        search = next(tool for tool in s.TOOLS if tool.name == "xdr_search")
+        self.assertIn(
+            "application_versions: version, ts_created, ts_updated",
+            search.input_schema["properties"]["ordering"]["description"],
+        )
+
     def test_only_the_tools_that_act_are_marked_destructive(self):
         with tempfile.TemporaryDirectory() as folder:
             s = load_server(XDR_ALLOW_WRITE="1", XDR_DOWNLOAD_DIR=folder, XDR_ALLOW_COLLECT="1")
@@ -611,7 +628,8 @@ class TestToolDispatch(unittest.TestCase):
         self.assertEqual(
             request.await_args_list,
             [
-                mock.call("GET", f"/api/assets/{ARTIFACT_ID}/"),
+                # sent as the agent reports it, not normalised to lower case
+                mock.call("GET", f"/api/assets/{ARTIFACT_ID.upper()}/"),
                 mock.call(
                     "GET",
                     "/api/assets/forensic-reports/?asset_id=42&ordering=-ts_created&cursor=1&page_size=20",
@@ -635,6 +653,10 @@ class TestToolDispatch(unittest.TestCase):
         for arguments in (
             {"ordering": "-size"},
             {"machine_id": "not-a-uuid"},
+            # uuid.UUID accepts these spellings; none of them may reach the URL
+            {"machine_id": "{" + ARTIFACT_ID + "}"},
+            {"machine_id": "urn:uuid:" + ARTIFACT_ID},
+            {"machine_id": ARTIFACT_ID.replace("-", "")},
             {"asset_id": 0},
             {"page_size": 100000},
         ):
@@ -656,6 +678,61 @@ class TestToolDispatch(unittest.TestCase):
         request, result = self.call("xdr_get_artifact_structure", {"report_id": 5, "path": "/var/../etc"})
         request.assert_not_awaited()
         self.assertTrue(result.is_error)
+
+    def test_application_versions_routes_all_read_operations(self):
+        self.server = load_server()
+        query = 'software_id: "11111111-1111-4111-8111-111111111111" AND version: "1.2.3"'
+        cases = [
+            ("xdr_search", {"query": ""}, ("POST", "/api/software/versions/check/", {"search": ""})),
+            (
+                "xdr_search", {"query": query, "page_size": 10, "offset": 3, "ordering": "-ts_updated"},
+                ("POST", "/api/software/versions/check/?ordering=-ts_updated&page_size=10&offset=3",
+                 {"search": query}),
+            ),
+            ("xdr_count", {}, ("GET", "/api/software/versions/count/")),
+            ("xdr_count", {"query": query}, ("POST", "/api/software/versions/count/", {"search": query})),
+            ("xdr_get_mapping", {}, ("GET", "/api/software/versions/mapping/")),
+            ("xdr_get_filters", {}, ("GET", "/api/software/versions/filters/")),
+            (
+                "xdr_get_suggestions", {"field": "vendor", "prefix": "Example Corp"},
+                ("GET", "/api/software/versions/search_help/?field=vendor&prefix=Example+Corp"),
+            ),
+        ]
+        for name, arguments, expected in cases:
+            with self.subTest(tool=name, arguments=arguments):
+                request, result = self.call(name, {"section": "application_versions", **arguments})
+                request.assert_awaited_once_with(*expected)
+                self.assertFalse(result.is_error)
+
+    def test_application_versions_preserves_records_and_empty_results(self):
+        self.server = load_server()
+        # The same version on two assets remains two records, with the API's count.
+        records = [
+            {"version": "1.2.3", "machine_id": "test-host-1", "computer_id": "1"},
+            {"version": "1.2.3", "machine_id": "test-host-2", "computer_id": "2"},
+        ]
+        for rows in (records, []):
+            with self.subTest(rows=rows):
+                payload = {"data": {"count": len(rows), "results": rows, "next": None, "previous": None}}
+                params = self.server.types.CallToolRequestParams(
+                    name="xdr_search", arguments={"section": "application_versions", "query": ""},
+                )
+                with mock.patch.object(self.server, "xdr_request", new_callable=mock.AsyncMock) as request:
+                    request.return_value = payload
+                    result = run(self.server.on_call_tool(None, params))
+                request.assert_awaited_once_with("POST", "/api/software/versions/check/", {"search": ""})
+                self.assertFalse(result.is_error)
+                self.assertEqual(json.loads(result.content[0].text), payload)
+
+    def test_applications_still_uses_software_routes(self):
+        for name, expected in (
+            ("xdr_search", ("POST", "/api/software/check/", {"search": ""})),
+            ("xdr_count", ("GET", "/api/software/count/")),
+        ):
+            with self.subTest(tool=name):
+                request, result = self.call(name, {"section": "applications", "query": ""})
+                request.assert_awaited_once_with(*expected)
+                self.assertFalse(result.is_error)
 
     def test_mark_event_sends_the_validated_payload(self):
         payload = {
@@ -847,7 +924,48 @@ class TestDownloadArtifact(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             self.requests[0].url.raw_path.endswith(b"/download/%2Fvar%2Flog%2Fsyslog/")
         )
-        self.assertEqual(os.path.basename(result["file"]), f"{ARTIFACT_ID[:8]}_syslog.zip")
+        tag = hashlib.sha256(b"/var/log/syslog").hexdigest()[:8]
+        self.assertEqual(os.path.basename(result["file"]), f"{ARTIFACT_ID[:8]}_{tag}_syslog.zip")
+
+    async def test_parts_with_one_name_in_different_folders_are_kept_apart(self):
+        first = await self.download(
+            self.zip_response(b"PK one", "var/log/syslog.zip"), path="/var/log/syslog"
+        )
+        second = await self.download(
+            self.zip_response(b"PK two", "var/log/old/syslog.zip"), path="/var/log/old/syslog"
+        )
+        self.assertNotEqual(first["file"], second["file"])
+        with open(first["file"], "rb") as file:
+            self.assertEqual(file.read(), b"PK one")
+        self.assertEqual(len(self.saved()), 2)
+
+    async def test_the_same_part_again_replaces_its_file(self):
+        first = await self.download(self.zip_response(b"PK old", "syslog.zip"), path="/var/log/syslog")
+        second = await self.download(self.zip_response(b"PK new", "syslog.zip"), path="/var/log/syslog")
+        self.assertEqual(first["file"], second["file"])
+        with open(second["file"], "rb") as file:
+            self.assertEqual(file.read(), b"PK new")
+        self.assertEqual(self.saved(), [os.path.basename(second["file"])])
+
+    @unittest.skipUnless(os.name == "posix", "file modes are POSIX")
+    async def test_the_saved_file_is_readable_by_its_owner_only(self):
+        result = await self.download(self.zip_response(b"PK", "a.zip"))
+        self.assertEqual(os.stat(result["file"]).st_mode & 0o777, 0o600)
+
+    @unittest.skipUnless(os.name == "posix", "symlinks need POSIX")
+    async def test_a_link_planted_in_the_folder_is_not_followed(self):
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, True)
+        victim = os.path.join(outside, "victim")
+        with open(victim, "wb") as file:
+            file.write(b"untouched")
+        # The name a fixed-name partial file would have had.
+        name = self.server.artifact_file_name(ARTIFACT_ID, 'filename="a.zip"')
+        os.symlink(victim, os.path.join(self.folder, name + ".part"))
+
+        await self.download(self.zip_response(b"PK", "a.zip"))
+        with open(victim, "rb") as file:
+            self.assertEqual(file.read(), b"untouched")
 
     async def test_a_path_not_in_the_artifact(self):
         # The API answers it with a 200 and an empty zip rather than an error.
