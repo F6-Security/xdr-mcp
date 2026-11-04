@@ -70,7 +70,15 @@ second factor in a native window and sends it straight to `XDR_BASE_URL`; it is
 not a tool argument, not in a result and not in an error. The window's text is
 passed to it as an argument, not spliced into a script, and shows what is being
 collected from which host, so it doubles as a human confirmation. Without the
-variable a one-time code goes through the chat.
+variable a one-time code goes through the chat; the platform would take that code
+again for a minute and a half, so the server lets one code go with one collection
+only.
+
+The second factor is waived for a token whose user has an IP allowlist, and for a
+request from an address the user's account trusts. With such a token nothing on
+the platform's side asks a person before a collection starts: the only check left
+is the MCP client's own confirmation of each tool call. Enable `XDR_ALLOW_COLLECT`
+with such a token only where every call is confirmed by hand.
 
 **The API key goes wherever `XDR_BASE_URL` points.** The URL is validated at
 startup — https only, no query or fragment — so the key cannot travel in the

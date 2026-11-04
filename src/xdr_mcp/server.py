@@ -13,6 +13,7 @@ import shutil
 import ssl
 import sys
 import tempfile
+import time
 import uuid
 from typing import Any
 from urllib.parse import quote, urlencode, urlsplit
@@ -51,6 +52,13 @@ ALLOW_COLLECT = os.environ.get("XDR_ALLOW_COLLECT", "").strip().lower() in ("1",
 # sees it, since it is not an argument, not in a result and not in an error.
 PASSWORD_PROMPT = os.environ.get("XDR_PASSWORD_PROMPT", "").strip().lower() in ("1", "true", "yes")
 PASSWORD_PROMPT_SECONDS = 120
+
+# A one-time code the user types into the chat stays valid for about a minute and
+# a half, and the platform takes the same code again within that time. The model
+# could carry it to a second collection the user never asked for, so here a code
+# goes with one collection only.
+OTP_REUSE_SECONDS = 180
+USED_OTPS: dict[str, float] = {}
 
 # Collected artifacts run from a few kilobytes of logs to memory dumps of many
 # gigabytes, so a download is capped unless the caller asks for more.
@@ -860,6 +868,15 @@ async def collect_artifacts(args: dict[str, Any]) -> dict[str, Any]:
     otp = args.get("otp")
     if otp is not None and (not isinstance(otp, str) or not re.fullmatch(r"\d{6,8}", otp)):
         raise ValueError("otp must be the 6-8 digit code from the user's authenticator app")
+    if otp:
+        now = time.monotonic()
+        for code, used_at in list(USED_OTPS.items()):
+            if now - used_at > OTP_REUSE_SECONDS:
+                del USED_OTPS[code]
+        if otp in USED_OTPS:
+            raise ValueError(
+                "this one-time code has already gone with a collection; ask the user for the current one"
+            )
 
     card = (await xdr_request("GET", f"/api/assets/{machine_id}/")).get("data") or {}
     asset_id = card.get("id")
@@ -956,6 +973,7 @@ async def collect_artifacts(args: dict[str, Any]) -> dict[str, Any]:
         body["preset_ids"] = preset_ids
     if otp:
         body["password"] = otp
+        USED_OTPS[otp] = time.monotonic()
 
     host = card.get("alias") or card.get("current_name") or body["asset"]
     what = list(artifacts)
@@ -963,7 +981,9 @@ async def collect_artifacts(args: dict[str, Any]) -> dict[str, Any]:
         what.append("пути " + ", ".join(paths[:5]) + (f" и ещё {len(paths) - 5}" if len(paths) > 5 else ""))
     if presets:
         what.append("пользовательские артефакты " + ", ".join(f"«{preset['name']}»" for preset in presets))
-    created = await post_collection(body, f"{host} ({os_name}) — {'; '.join(what)}")
+    # The host name comes from the agent, so a host can call itself anything; the
+    # machine id beside it is the platform's own.
+    created = await post_collection(body, f"{host} ({os_name}), {body['asset']} — {'; '.join(what)}")
 
     report_id = (created.get("data") or {}).get("id")
     row = next((row for row in await recent_collections(asset_id) if row.get("id") == report_id), None)

@@ -1285,6 +1285,19 @@ class TestCollectArtifacts(unittest.TestCase):
         self.assertFalse(self.collect(api, artifacts=["shell_history"], otp="123456").is_error)
         self.assertEqual(api.posts()[0]["password"], "123456")
 
+    def test_a_code_goes_with_one_collection_only(self):
+        # The platform takes one code again for a minute and a half; the model must not.
+        first = FakeApi(card(LINUX_OPTIONS))
+        self.assertFalse(self.collect(first, artifacts=["shell_history"], otp="123456").is_error)
+        second = FakeApi(card(LINUX_OPTIONS))
+        result = self.collect(second, artifacts=["shadow"], otp="123456")
+        self.assertTrue(result.is_error)
+        self.assertIn("already gone with a collection", result.content[0].text)
+        self.assertEqual(second.calls, [])
+        # A fresh code goes through.
+        third = FakeApi(card(LINUX_OPTIONS))
+        self.assertFalse(self.collect(third, artifacts=["shadow"], otp="654321").is_error)
+
     def test_a_malformed_code_is_refused_before_any_request(self):
         for otp in ("12ab56", "123", 123456, ""):
             with self.subTest(otp=otp):
@@ -1406,7 +1419,8 @@ class TestPasswordPrompt(unittest.TestCase):
         self.assertEqual(second["password"], "s3cret pass")
         # The person sees what they are letting through, and what the console said.
         prompt = ask.await_args.args[0]
-        for expected in ("WS-1 (Linux)", "shell_history", "/etc/hosts", "Неверный код"):
+        # The host names itself, so the window shows the platform's machine id beside it.
+        for expected in ("WS-1 (Linux)", MACHINE_ID.upper(), "shell_history", "/etc/hosts", "Неверный код"):
             self.assertIn(expected, prompt)
         self.assertNotIn("s3cret", result.content[0].text)
 
